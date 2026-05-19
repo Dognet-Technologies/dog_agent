@@ -34,6 +34,13 @@ pub enum AgentMessage {
     /// Log minacce rilevate localmente
     ThreatLog { threats: Vec<ThreatEntry> },
 
+    /// Snapshot completo firewall+system prodotto da `firewall-manager --export-json`.
+    /// Il payload è il JSON grezzo del comando (vedi FirewallStats sul server).
+    FirewallStats {
+        timestamp: String,
+        payload: serde_json::Value,
+    },
+
     /// Risposta a un comando ricevuto dal server
     CommandResponse {
         command_id: String,
@@ -70,6 +77,12 @@ pub enum ServerMessage {
 
     /// Conferma ricezione threat log
     ThreatAck,
+
+    /// Conferma ricezione snapshot firewall_stats
+    FirewallStatsAck,
+
+    /// Errore generico inviato dal server (es. payload malformato, non paired, ecc.)
+    Error { message: String },
 
     /// Comando da eseguire sull'agent
     Command {

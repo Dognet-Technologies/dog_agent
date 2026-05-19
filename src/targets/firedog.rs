@@ -67,6 +67,14 @@ async fn session(config: &TargetConfig) -> Result<()> {
     let mut threat_timer = interval(Duration::from_secs(60));
     threat_timer.tick().await;
 
+    // Forward del file status.json prodotto da `firewall-manager --export-json` (cron).
+    // Cadenza 60s: il file viene riscritto ogni 5 min, ma controllarlo più spesso
+    // permette di intercettare snapshot fuori-banda (es. invocazione manuale).
+    let mut fwstats_timer = interval(Duration::from_secs(60));
+    fwstats_timer.tick().await;
+    let fwstats_path = std::path::PathBuf::from("/opt/sentinelsuite/firedog/export/status.json");
+    let mut last_fwstats_mtime: Option<std::time::SystemTime> = None;
+
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
         tokio::select! {
@@ -80,6 +88,12 @@ async fn session(config: &TargetConfig) -> Result<()> {
                     let msg = AgentMessage::ThreatLog { threats };
                     tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
                     debug!("[{}] threat_log inviato", config.name);
+                }
+            }
+
+            _ = fwstats_timer.tick() => {
+                if let Err(e) = forward_firewall_stats(config, &mut tx, &fwstats_path, &mut last_fwstats_mtime).await {
+                    warn!("[{}] firewall_stats forward fallito: {}", config.name, e);
                 }
             }
 
@@ -208,6 +222,12 @@ where
         ServerMessage::ThreatAck => {
             debug!("[{}] threat_ack ricevuto", config.name);
         }
+        ServerMessage::FirewallStatsAck => {
+            debug!("[{}] firewall_stats_ack ricevuto", config.name);
+        }
+        ServerMessage::Error { message } => {
+            warn!("[{}] Errore dal server: {}", config.name, message);
+        }
         ServerMessage::Command { command_id, action, payload } => {
             info!("[{}] Comando ricevuto: {:?}", config.name, action);
             let (status, output, error) =
@@ -302,4 +322,39 @@ async fn run_integrity_check(paths: &[String]) -> Result<String> {
 fn next_backoff(current: Duration, config: &TargetConfig) -> Duration {
     let next_secs = (current.as_secs() as f64 * config.reconnect.backoff_multiplier) as u64;
     Duration::from_secs(next_secs.min(config.reconnect.max_backoff))
+}
+
+/// Legge il file `status.json` (output di `firewall-manager --export-json`) e lo
+/// inoltra al server come messaggio `firewall_stats`. Salta l'invio se il file non
+/// esiste o se mtime non è cambiato dall'ultimo invio.
+async fn forward_firewall_stats<S>(
+    config: &TargetConfig,
+    tx: &mut S,
+    path: &std::path::Path,
+    last_mtime: &mut Option<std::time::SystemTime>,
+) -> Result<()>
+where
+    S: futures_util::SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("[{}] status.json non presente ({})", config.name, path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mtime = metadata.modified()?;
+    if Some(mtime) == *last_mtime {
+        return Ok(()); // nessuna nuova snapshot dal cron
+    }
+
+    let raw = tokio::fs::read_to_string(path).await?;
+    let payload: serde_json::Value = serde_json::from_str(&raw)?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let msg = AgentMessage::FirewallStats { timestamp, payload };
+    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+    info!("[{}] firewall_stats inviato (snapshot mtime={:?})", config.name, mtime);
+    *last_mtime = Some(mtime);
+    Ok(())
 }
