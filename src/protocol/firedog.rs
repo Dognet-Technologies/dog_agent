@@ -105,6 +105,12 @@ pub struct SystemStats {
     pub cpu_percent: f32,
     pub memory_percent: f32,
     pub disk_percent: f32,
+    // Valori assoluti in KB — il server li persiste come colonne dedicate
+    // così la UI non deve più derivare "Memory MB" dal solo percent.
+    pub memory_total_kb: u64,
+    pub memory_used_kb: u64,
+    pub disk_total_kb: u64,
+    pub disk_used_kb: u64,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
     pub active_rules_count: u32,
