@@ -148,30 +148,32 @@ impl FirewallManager {
     }
 
     pub fn sync_rules(&self) -> Result<String> {
-        warn!("sync_rules: flush completo e riapplicazione regole in-memory");
-        // In una implementazione completa si salverebbe lo stato
-        // su disco con iptables-save/restore.
-        // Per ora flush delle chain e riscrittura da state.
-        run_iptables(&["-F".to_string(), "INPUT".to_string()])?;
-        run_iptables(&["-F".to_string(), "OUTPUT".to_string()])?;
+        // "Sync" = rigenera lo snapshot completo via firewall-manager e
+        // ritorna il JSON al server come output del comando. Il server lo
+        // ingerisce nelle stesse tabelle che firewall_stats popola — la UI
+        // vede le rule aggiornate immediatamente, senza aspettare il
+        // prossimo tick del fwstats_timer (60s).
+        //
+        // L'implementazione precedente (flush + replay in-memory) era
+        // pericolosa: avrebbe cancellato regole legittime se l'agent era
+        // stato riavviato. Sostituita con un re-export non distruttivo.
+        let export_path = "/opt/sentinelsuite/firedog/export/status.json";
+        info!("sync_rules: rigenero snapshot via firewall-manager --export-json");
 
-        let state = self.state.lock().unwrap();
-        for rule in &state.active_rules {
-            let mut args = vec!["-A".to_string(), rule.chain.clone()];
-            args.extend(rule.rule_spec.split_whitespace().map(String::from));
-            let _ = run_iptables(&args);
+        let out = std::process::Command::new("firewall-manager")
+            .args(["--export-json", export_path])
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("firewall-manager --export-json fallito: {}", stderr.trim());
         }
 
-        for ip in &state.blocked_ips {
-            let _ = run_iptables(&["-A".to_string(), "INPUT".to_string(), "-s".to_string(), ip.clone(), "-j".to_string(), "DROP".to_string()]);
-        }
-
-        Ok(format!(
-            "Sync completato: {} regole, {} IP bloccati",
-            state.active_rules.len(),
-            state.blocked_ips.len()
-        ))
+        // Restituisci il contenuto del file come stringa JSON: il server
+        // legge `output` dal CommandResponse e lo ingerisce.
+        let json = std::fs::read_to_string(export_path)?;
+        Ok(json)
     }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
