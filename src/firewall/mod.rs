@@ -50,22 +50,26 @@ impl FirewallManager {
     // ── Comandi pubblici ──────────────────────────────────────────────────────
 
     pub fn add_rule(&self, p: &AddRulePayload) -> Result<String> {
-        let spec = build_rule_spec(p)?;
-        let args = ["-A", &p.chain].iter()
-            .chain(spec.split_whitespace().collect::<Vec<_>>().iter())
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+        // Costruisce args come vettore di token: Command::args li passa intatti
+        // al processo (no shell, no split su whitespace). I commenti con spazi
+        // restano un singolo argomento.
+        let mut args: Vec<String> = vec!["-A".into(), p.chain.clone()];
+        args.extend(build_rule_args(p));
 
         run_iptables(&args)?;
 
-        let record = RuleRecord {
+        let pretty = args
+            .iter()
+            .map(|a| if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.state.lock().unwrap().active_rules.push(RuleRecord {
             chain: p.chain.clone(),
-            rule_spec: spec.clone(),
-        };
-        self.state.lock().unwrap().active_rules.push(record);
+            rule_spec: pretty.clone(),
+        });
 
-        info!("Regola aggiunta: -A {} {}", p.chain, spec);
-        Ok(format!("Regola aggiunta: -A {} {}", p.chain, spec))
+        info!("Regola aggiunta: iptables {}", pretty);
+        Ok(format!("Regola aggiunta: iptables {}", pretty))
     }
 
     pub fn remove_rule(&self, p: &RemoveRulePayload) -> Result<String> {
@@ -172,30 +176,38 @@ impl FirewallManager {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_rule_spec(p: &AddRulePayload) -> Result<String> {
-    let mut parts = Vec::new();
+/// Costruisce gli argomenti iptables in formato vettoriale. Command::args li
+/// passa intatti al processo (no shell, no quoting). I commenti con spazi
+/// vengono mantenuti come singolo argomento.
+fn build_rule_args(p: &AddRulePayload) -> Vec<String> {
+    let mut args = Vec::new();
 
     if let Some(ref proto) = p.protocol {
-        parts.push(format!("-p {}", proto));
+        args.extend(["-p".into(), proto.clone()]);
     }
     if let Some(ref src) = p.src_ip {
-        parts.push(format!("-s {}", src));
+        args.extend(["-s".into(), src.clone()]);
     }
     if let Some(ref dst) = p.dst_ip {
-        parts.push(format!("-d {}", dst));
+        args.extend(["-d".into(), dst.clone()]);
     }
     if let Some(port) = p.src_port {
-        parts.push(format!("--sport {}", port));
+        args.extend(["--sport".into(), port.to_string()]);
     }
     if let Some(port) = p.dst_port {
-        parts.push(format!("--dport {}", port));
+        args.extend(["--dport".into(), port.to_string()]);
     }
     if let Some(ref comment) = p.comment {
-        parts.push(format!("-m comment --comment \"{}\"", comment));
+        args.extend([
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            comment.clone(),
+        ]);
     }
-    parts.push(format!("-j {}", p.action));
+    args.extend(["-j".into(), p.action.clone()]);
 
-    Ok(parts.join(" "))
+    args
 }
 
 fn run_iptables(args: &[String]) -> Result<()> {

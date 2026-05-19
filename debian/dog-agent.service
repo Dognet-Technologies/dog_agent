@@ -8,19 +8,21 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=dog-agent
-Group=dog-agent
+# L'agent deve poter manipolare iptables (lock file /run/xtables.lock è di root)
+# e leggere /proc/<pid>/... per i collector di sistema. Gira come root con
+# ProtectSystem=strict per limitarne i side-effect sul filesystem.
+User=root
+Group=root
 ExecStart=/usr/bin/dog-agent --config /etc/dog-agent/agent.conf
 Restart=on-failure
 RestartSec=5s
 
-# Sicurezza
+# Sicurezza (anche da root, riduciamo la superficie scrivibile)
 NoNewPrivileges=false
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/log/dog-agent /var/run/dog-agent
+ReadWritePaths=/var/log/dog-agent /var/run/dog-agent /run/xtables.lock
 PrivateTmp=true
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 
 # Logging
 StandardOutput=journal
