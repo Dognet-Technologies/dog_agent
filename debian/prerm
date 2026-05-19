@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+#DEBHELPER#
+
 if [ -d /run/systemd/system ]; then
     systemctl stop dog-agent 2>/dev/null || true
     systemctl disable dog-agent 2>/dev/null || true

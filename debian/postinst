@@ -21,9 +21,11 @@ if [ ! -f /etc/dog-agent/agent.conf ]; then
     echo ""
 fi
 
-# Ricarica systemd e abilita il servizio
+# cargo-deb systemd-units helper injection
+#DEBHELPER#
+
 if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload
+    systemctl daemon-reload || true
     echo "Servizio dog-agent installato."
     echo "Per abilitare all'avvio: systemctl enable dog-agent"
     echo "Per avviare ora:         systemctl start dog-agent"
