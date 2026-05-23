@@ -21,7 +21,15 @@ RestartSec=5s
 NoNewPrivileges=false
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/log/dog-agent /var/run/dog-agent /run/xtables.lock
+# /run è tmpfs e viene azzerato ad ogni boot. RuntimeDirectory chiede a
+# systemd di crearlo (e rimuoverlo allo stop) → niente "No such file or
+# directory" per /run/dog-agent quando ProtectSystem=strict applica il
+# mount namespacing.
+RuntimeDirectory=dog-agent
+RuntimeDirectoryMode=0755
+LogsDirectory=dog-agent
+LogsDirectoryMode=0755
+ReadWritePaths=/var/log/dog-agent /run/dog-agent /run/xtables.lock
 PrivateTmp=true
 
 # Logging
