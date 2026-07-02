@@ -70,10 +70,13 @@ A single binary configured via /etc/dog-agent/agent.conf."""
 depends = "$auto"
 section = "net"
 priority = "optional"
+# NB: la unit systemd NON va elencata qui — la feature `systemd-units` di
+# cargo-deb la preleva automaticamente da maintainer-scripts (debian/) e la
+# installa in lib/systemd/system/. Elencarla anche negli assets la duplica
+# nel pacchetto (due file systemd in conflitto all'installazione).
 assets = [
     ["target/release/dog-agent", "usr/bin/", "755"],
     ["config.example.toml", "etc/dog-agent/agent.conf.example", "644"],
-    ["debian/dog-agent.service", "lib/systemd/system/", "644"],
 ]
 conf-files = ["/etc/dog-agent/agent.conf"]
 maintainer-scripts = "debian/"

@@ -6,10 +6,11 @@ if ! id -u dog-agent > /dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin dog-agent
 fi
 
-# Crea directory necessarie
+# Crea directory necessarie.
+# /run/dog-agent e /var/log/dog-agent NON vanno creati qui: li gestisce
+# systemd via RuntimeDirectory/LogsDirectory (con l'ownership del servizio).
+# Crearli a mano con owner diverso genera conflitti al primo avvio.
 install -d -m 750 -o dog-agent -g dog-agent /etc/dog-agent
-install -d -m 755 -o dog-agent -g dog-agent /var/log/dog-agent
-install -d -m 755 -o dog-agent -g dog-agent /var/run/dog-agent
 
 # Se non esiste ancora un file di config, copia l'esempio
 if [ ! -f /etc/dog-agent/agent.conf ]; then
