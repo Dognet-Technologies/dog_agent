@@ -77,6 +77,7 @@ priority = "optional"
 assets = [
     ["target/release/dog-agent", "usr/bin/", "755"],
     ["config.example.toml", "etc/dog-agent/agent.conf.example", "644"],
+    ["debian/dog-agent.tmpfiles", "usr/lib/tmpfiles.d/dog-agent.conf", "644"],
 ]
 conf-files = ["/etc/dog-agent/agent.conf"]
 maintainer-scripts = "debian/"

@@ -13,10 +13,6 @@ Type=simple
 # ProtectSystem=strict per limitarne i side-effect sul filesystem.
 User=root
 Group=root
-# /run/xtables.lock viene creato dal primo iptables eseguito dopo il boot:
-# se manca, ReadWritePaths fallisce il mount namespace (226/NAMESPACE).
-# Il prefisso "+" esegue il touch FUORI dal sandbox, sul /run reale.
-ExecStartPre=+/usr/bin/touch /run/xtables.lock
 ExecStart=/usr/bin/dog-agent --config /etc/dog-agent/agent.conf
 Restart=on-failure
 RestartSec=5s
@@ -35,6 +31,8 @@ LogsDirectory=dog-agent
 LogsDirectoryMode=0755
 # /var/log/dog-agent e /run/dog-agent sono già scrivibili via
 # LogsDirectory/RuntimeDirectory (whitelisting automatico di systemd).
+# /run/xtables.lock deve ESISTERE prima dell'avvio o il mount namespace
+# fallisce (226/NAMESPACE): lo garantisce tmpfiles.d/dog-agent.conf.
 # Il prefisso "-" su /opt/... ignora il path se firewall-manager non è
 # installato su questa macchina: sync_rules esegue firewall-manager come
 # figlio dell'agent, che eredita il namespace → l'export deve essere

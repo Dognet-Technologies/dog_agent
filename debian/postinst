@@ -27,6 +27,9 @@ fi
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
+    # Crea subito /run/xtables.lock (a regime lo fa tmpfiles.d a ogni boot):
+    # senza, il primo start post-install fallirebbe con 226/NAMESPACE.
+    systemd-tmpfiles --create dog-agent.conf || true
     echo "Servizio dog-agent installato."
     echo "Per abilitare all'avvio: systemctl enable dog-agent"
     echo "Per avviare ora:         systemctl start dog-agent"
