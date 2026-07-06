@@ -1,0 +1,41 @@
+[Unit]
+Description=Dognet Unified Agent (FireDog / CyberSheppard / SentinelCore)
+Documentation=https://github.com/dognet/dog-agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# L'agent deve poter manipolare iptables (lock file /run/xtables.lock è di root)
+# e leggere /proc/<pid>/... per i collector di sistema. Gira come root con
+# ProtectSystem=strict per limitarne i side-effect sul filesystem.
+User=root
+Group=root
+ExecStart=/usr/bin/dog-agent --config /etc/dog-agent/agent.conf
+Restart=on-failure
+RestartSec=5s
+
+# Sicurezza (anche da root, riduciamo la superficie scrivibile)
+NoNewPrivileges=false
+ProtectHome=true
+ProtectSystem=strict
+# /run è tmpfs e viene azzerato ad ogni boot. RuntimeDirectory chiede a
+# systemd di crearlo (e rimuoverlo allo stop) → niente "No such file or
+# directory" per /run/dog-agent quando ProtectSystem=strict applica il
+# mount namespacing.
+RuntimeDirectory=dog-agent
+RuntimeDirectoryMode=0755
+LogsDirectory=dog-agent
+LogsDirectoryMode=0755
+ReadWritePaths=/var/log/dog-agent /run/dog-agent /run/xtables.lock
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dog-agent
+
+[Install]
+WantedBy=multi-user.target

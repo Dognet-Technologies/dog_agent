@@ -1,0 +1,34 @@
+#!/bin/bash
+set -e
+
+# Crea utente di sistema se non esiste
+if ! id -u dog-agent > /dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin dog-agent
+fi
+
+# Crea directory necessarie
+install -d -m 750 -o dog-agent -g dog-agent /etc/dog-agent
+install -d -m 755 -o dog-agent -g dog-agent /var/log/dog-agent
+install -d -m 755 -o dog-agent -g dog-agent /var/run/dog-agent
+
+# Se non esiste ancora un file di config, copia l'esempio
+if [ ! -f /etc/dog-agent/agent.conf ]; then
+    cp /etc/dog-agent/agent.conf.example /etc/dog-agent/agent.conf
+    chmod 640 /etc/dog-agent/agent.conf
+    chown dog-agent:dog-agent /etc/dog-agent/agent.conf
+    echo ""
+    echo "ATTENZIONE: configurare /etc/dog-agent/agent.conf prima di avviare il servizio."
+    echo ""
+fi
+
+# cargo-deb systemd-units helper injection
+#DEBHELPER#
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    echo "Servizio dog-agent installato."
+    echo "Per abilitare all'avvio: systemctl enable dog-agent"
+    echo "Per avviare ora:         systemctl start dog-agent"
+fi
+
+exit 0
