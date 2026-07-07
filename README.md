@@ -13,6 +13,7 @@ in `/etc/dog-agent/agent.conf`.
 |---|---|---|
 | Rust toolchain (≥ 1.75) | [rustup.rs](https://rustup.rs) | build |
 | `cargo-deb` | `cargo install cargo-deb` | packaging `.deb` |
+| `cargo-generate-rpm` | `cargo install cargo-generate-rpm` | packaging `.rpm` |
 | `musl-tools` (`musl-gcc`) | `apt install musl-tools` | build statica musl |
 | target musl | `rustup target add x86_64-unknown-linux-musl` | build statica musl |
 | `cross` + Docker | `cargo install cross` | cross-compile arm64 / Windows |
@@ -49,9 +50,13 @@ make fmt              # cargo fmt
 ## Packaging `.deb`
 
 ```bash
-# glibc (usa target/release/dog-agent)
+# glibc (usa target/release/dog-agent) — solo per distro con glibc >= a
+# quella della macchina di build; per il deploy usare deb-musl
 make deb              # = cargo build --release && cargo deb
 # output: target/debian/dog-agent_<versione>_amd64.deb
+
+# musl statico — il .deb consigliato per il deploy (gira su qualsiasi glibc)
+make deb-musl         # = cargo deb --target x86_64-unknown-linux-musl
 
 # arm64 (richiede cross + Docker)
 make deb-arm64
@@ -72,9 +77,26 @@ due volte produce un pacchetto con due copie in conflitto
 (`lib/systemd/system` e `usr/lib/systemd/system` sono lo stesso path sui
 sistemi usr-merged).
 
-⚠️ `make deb` impacchetta la build **glibc**. Se serve il `.deb` col binario
-statico musl va passato il target sia a cargo sia a cargo-deb
-(`cargo deb --target x86_64-unknown-linux-musl` + asset adeguato).
+⚠️ `make deb` impacchetta la build **glibc**: un .deb buildato su una distro
+con glibc più recente dei target NON si installa (es. build su glibc 2.39,
+target Debian 12 con 2.36). `make deb-musl` non ha questo problema —
+cargo-deb riscrive da solo gli asset `target/release/` sul target musl e il
+binario statico non genera la dipendenza `libc6`.
+
+## Packaging `.rpm` (openSUSE / RHEL)
+
+```bash
+make rpm              # build musl + cargo generate-rpm
+# output: target/generate-rpm/dog-agent-<versione>-1.x86_64.rpm
+```
+
+L'RPM impacchetta **sempre** il binario statico musl (`AutoReq` disattivato:
+nessuna dipendenza runtime) con gli stessi file del .deb; gli scriptlet
+`%post`/`%preun` replicano `debian/postinst` e `debian/prerm`. Installazione:
+
+```bash
+sudo rpm -i dog-agent-<versione>-1.x86_64.rpm     # oppure zypper install / dnf install
+```
 
 ## Installazione sul target
 
