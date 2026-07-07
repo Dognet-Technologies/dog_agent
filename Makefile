@@ -7,7 +7,7 @@
 #   - cross:      cargo install cross  (per cross-compilazione)
 #   - Docker:     richiesto da cross
 
-.PHONY: all build release deb deb-musl exe clean fmt check
+.PHONY: all build release deb deb-musl rpm exe clean fmt check
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
@@ -33,6 +33,15 @@ deb-musl:
 deb-arm64:
 	cross build --release --target aarch64-unknown-linux-gnu
 	cargo deb --no-build --target aarch64-unknown-linux-gnu
+
+# ── Packaging Linux (.rpm) ────────────────────────────────────────────────────
+
+# .rpm (openSUSE/RHEL) col binario statico musl — richiede cargo-generate-rpm.
+# Gli asset in [package.metadata.generate-rpm] puntano già alla build musl.
+rpm:
+	cargo build --release --target x86_64-unknown-linux-musl
+	cargo generate-rpm
+	@echo "Output: target/generate-rpm/"
 
 # ── Packaging Windows (.exe) ──────────────────────────────────────────────────
 

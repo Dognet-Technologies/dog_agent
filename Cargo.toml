@@ -1,9 +1,10 @@
 [package]
 name = "dog-agent"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["Dognet Technologies"]
 description = "Unified agent for Dognet Suite (FireDog, CyberSheppard, SentinelCore)"
+license = "Proprietary"
 
 [[bin]]
 name = "dog-agent"
@@ -82,3 +83,52 @@ assets = [
 conf-files = ["/etc/dog-agent/agent.conf"]
 maintainer-scripts = "debian/"
 systemd-units = { enable = false }
+
+# cargo-generate-rpm metadata per il packaging .rpm (openSUSE/RHEL).
+# Impacchetta SEMPRE il binario statico musl: nessuna AutoReq (il binario
+# non ha dipendenze runtime) e stesso comportamento su qualsiasi glibc.
+# Gli scriptlet replicano debian/postinst e debian/prerm.
+[package.metadata.generate-rpm]
+auto-req = "no"
+assets = [
+    { source = "target/x86_64-unknown-linux-musl/release/dog-agent", dest = "/usr/bin/dog-agent", mode = "755" },
+    { source = "config.example.toml", dest = "/etc/dog-agent/agent.conf.example", mode = "644" },
+    { source = "debian/dog-agent.service", dest = "/usr/lib/systemd/system/dog-agent.service", mode = "644" },
+    { source = "debian/dog-agent.tmpfiles", dest = "/usr/lib/tmpfiles.d/dog-agent.conf", mode = "644" },
+]
+post_install_script = """
+#!/bin/sh
+set -e
+if ! id -u dog-agent > /dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin dog-agent
+fi
+# /run/dog-agent e /var/log/dog-agent li gestisce systemd via
+# RuntimeDirectory/LogsDirectory — non crearli qui (vedi debian/postinst).
+install -d -m 750 -o dog-agent -g dog-agent /etc/dog-agent
+if [ ! -f /etc/dog-agent/agent.conf ]; then
+    cp /etc/dog-agent/agent.conf.example /etc/dog-agent/agent.conf
+    chmod 640 /etc/dog-agent/agent.conf
+    chown dog-agent:dog-agent /etc/dog-agent/agent.conf
+    echo ""
+    echo "ATTENZIONE: configurare /etc/dog-agent/agent.conf prima di avviare il servizio."
+    echo ""
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    # Senza /run/xtables.lock il primo start fallirebbe con 226/NAMESPACE.
+    systemd-tmpfiles --create dog-agent.conf || true
+    echo "Servizio dog-agent installato."
+    echo "Per abilitare all'avvio: systemctl enable dog-agent"
+    echo "Per avviare ora:         systemctl start dog-agent"
+fi
+exit 0
+"""
+pre_uninstall_script = """
+#!/bin/sh
+# $1 = 0 rimozione completa, >= 1 upgrade: fermare il servizio solo alla rimozione
+if [ "$1" = "0" ] && [ -d /run/systemd/system ]; then
+    systemctl stop dog-agent 2>/dev/null || true
+    systemctl disable dog-agent 2>/dev/null || true
+fi
+exit 0
+"""
