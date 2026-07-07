@@ -4,7 +4,7 @@ version = "1.0.1"
 edition = "2021"
 authors = ["Dognet Technologies"]
 description = "Unified agent for Dognet Suite (FireDog, CyberSheppard, SentinelCore)"
-license = "Proprietary"
+license = "MIT"
 
 [[bin]]
 name = "dog-agent"
