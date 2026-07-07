@@ -1,0 +1,74 @@
+# Dog Agent - Configurazione
+# Copia questo file in /etc/dog-agent/agent.conf e adattalo.
+#
+# L'agent supporta più target contemporaneamente:
+# ogni [[targets]] gira in un task tokio indipendente.
+
+[agent]
+# Livello di log: debug | info | warn | error
+log_level = "info"
+
+# ─────────────────────────────────────────────────────────────
+# ESEMPIO: Target FireDog
+# ─────────────────────────────────────────────────────────────
+[[targets]]
+name          = "firedog-production"
+system_type   = "firedog"
+url           = "wss://firedog.yourdomain.com"
+api_key       = "YOUR_FIREDOG_API_KEY_HERE"
+
+# Dati identità macchina (devono corrispondere a quelli configurati sul server)
+# Il server calcola SHA512(ip + hostname + mac) per la fase 2 del pairing.
+ip            = "192.168.1.100"
+hostname      = "web-server-01"
+mac           = "AA:BB:CC:DD:EE:FF"
+
+# Intervallo heartbeat in secondi (default: 30)
+heartbeat_interval  = 30
+
+# Blocco automatico locale se score >= threat_threshold
+auto_block_threats  = true
+threat_threshold    = 75
+
+# Path monitorati per integrità file (FireDog check_integrity)
+integrity_paths = ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+
+# Reconnessione con exponential backoff
+reconnect = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }
+
+# ─────────────────────────────────────────────────────────────
+# ESEMPIO: Target CyberSheppard
+# ─────────────────────────────────────────────────────────────
+[[targets]]
+name              = "cybersheppard-main"
+system_type       = "cybersheppard"
+url               = "wss://cybersheppard.yourdomain.com"
+api_key           = "YOUR_CYBERSHEPPARD_TOKEN_HERE"
+
+# ID assegnato dal backend CyberSheppard a questo target
+target_id         = 1
+
+# Intervalli raccolta/invio metriche in secondi
+collection_interval = 30
+send_interval       = 10
+
+# Livello compressione Zstd: 1 (veloce) .. 22 (massima), default 3
+compression_level   = 3
+
+# Buffer massimo prima del flush forzato
+max_buffer_size     = 10
+
+# Collector abilitati
+collectors = { system = true, network = true, users = true, files = true, services = true, auditd = true, docker = true }
+
+reconnect = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }
+
+# ─────────────────────────────────────────────────────────────
+# ESEMPIO: Target SentinelCore (predisposto, non ancora attivo)
+# ─────────────────────────────────────────────────────────────
+# [[targets]]
+# name        = "sentinelcore-main"
+# system_type = "sentinelcore"
+# url         = "wss://sentinelcore.yourdomain.com"
+# api_key     = "YOUR_SENTINELCORE_API_KEY_HERE"
+# reconnect   = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }

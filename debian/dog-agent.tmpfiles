@@ -1,0 +1,8 @@
+# tmpfiles.d per dog-agent.
+#
+# /run/xtables.lock viene normalmente creato dal primo iptables eseguito
+# dopo il boot, ma la unit dog-agent lo bind-monta via ReadWritePaths
+# (necessario sotto ProtectSystem=strict): se il file non esiste il mount
+# namespace fallisce con 226/NAMESPACE. Lo creiamo a ogni boot via
+# systemd-tmpfiles, che gira prima dei servizi di multi-user.target.
+f /run/xtables.lock 0600 root root -

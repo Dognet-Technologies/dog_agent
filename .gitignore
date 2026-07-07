@@ -1,0 +1,7 @@
+/target/
+Cargo.lock
+*.deb
+*.exe
+.env
+/etc/
+.claude/

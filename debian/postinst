@@ -1,0 +1,38 @@
+#!/bin/bash
+set -e
+
+# Crea utente di sistema se non esiste
+if ! id -u dog-agent > /dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin dog-agent
+fi
+
+# Crea directory necessarie.
+# /run/dog-agent e /var/log/dog-agent NON vanno creati qui: li gestisce
+# systemd via RuntimeDirectory/LogsDirectory (con l'ownership del servizio).
+# Crearli a mano con owner diverso genera conflitti al primo avvio.
+install -d -m 750 -o dog-agent -g dog-agent /etc/dog-agent
+
+# Se non esiste ancora un file di config, copia l'esempio
+if [ ! -f /etc/dog-agent/agent.conf ]; then
+    cp /etc/dog-agent/agent.conf.example /etc/dog-agent/agent.conf
+    chmod 640 /etc/dog-agent/agent.conf
+    chown dog-agent:dog-agent /etc/dog-agent/agent.conf
+    echo ""
+    echo "ATTENZIONE: configurare /etc/dog-agent/agent.conf prima di avviare il servizio."
+    echo ""
+fi
+
+# cargo-deb systemd-units helper injection
+#DEBHELPER#
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    # Crea subito /run/xtables.lock (a regime lo fa tmpfiles.d a ogni boot):
+    # senza, il primo start post-install fallirebbe con 226/NAMESPACE.
+    systemd-tmpfiles --create dog-agent.conf || true
+    echo "Servizio dog-agent installato."
+    echo "Per abilitare all'avvio: systemctl enable dog-agent"
+    echo "Per avviare ora:         systemctl start dog-agent"
+fi
+
+exit 0
