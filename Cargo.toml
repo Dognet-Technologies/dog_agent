@@ -1,6 +1,6 @@
 [package]
 name = "dog-agent"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 authors = ["Dognet Technologies"]
 description = "Unified agent for Dognet Suite (FireDog, CyberSheppard, SentinelCore)"
