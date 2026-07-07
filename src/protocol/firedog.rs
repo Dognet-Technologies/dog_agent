@@ -61,14 +61,18 @@ pub enum AgentMessage {
 pub enum ServerMessage {
     /// Risultato del pairing (fase 1 e/o fase 2)
     PairingStatus {
-        /// "success" | "failed" | "phase_1_ok" | "expired"
+        /// "success" | "failed" | "verifying" | "expired"
         status: String,
+        // Nei messaggi di fallimento il server omette i flag di fase e mette
+        // il motivo nel campo `error` — tutti i campi devono essere opzionali
+        // o il messaggio non viene parsato e il pairing muore in timeout.
+        #[serde(default)]
         phase_1_verified: bool,
         #[serde(default)]
         phase_2_verified: bool,
         #[serde(default)]
         target_id: Option<i32>,
-        #[serde(default)]
+        #[serde(default, alias = "error")]
         message: Option<String>,
     },
 

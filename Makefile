@@ -7,7 +7,7 @@
 #   - cross:      cargo install cross  (per cross-compilazione)
 #   - Docker:     richiesto da cross
 
-.PHONY: all build release deb exe clean fmt check
+.PHONY: all build release deb deb-musl exe clean fmt check
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
@@ -23,6 +23,11 @@ release:
 
 deb: release
 	cargo deb
+
+# .deb con binario STATICO musl — portabile su qualsiasi glibc (Debian 12/13, RHEL…)
+# cargo-deb riscrive da solo gli asset `target/release/` → `target/<triple>/release/`.
+deb-musl:
+	cargo deb --target x86_64-unknown-linux-musl
 
 # Crea .deb per target arm64 (es. Raspberry Pi, server ARM)
 deb-arm64:
