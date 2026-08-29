@@ -184,6 +184,21 @@ impl FirewallManager {
 fn build_rule_args(p: &AddRulePayload) -> Vec<String> {
     let mut args = Vec::new();
 
+    // Interfaccia (vuota/assente = tutto l'host, comportamento storico).
+    if let Some(ref iface) = p.interface {
+        match p.chain.as_str() {
+            "INPUT" => args.extend(["-i".into(), iface.clone()]),
+            "OUTPUT" => args.extend(["-o".into(), iface.clone()]),
+            // FORWARD: il backend non dovrebbe mai inviarla (validata a
+            // monte), ma per sicurezza logga e ignora invece di applicare
+            // una regola più larga di quanto l'operatore si aspetti.
+            other => warn!(
+                "interface '{}' ignorata su chain {}: non supportata (serve -i e -o)",
+                iface, other
+            ),
+        }
+    }
+
     if let Some(ref proto) = p.protocol {
         args.extend(["-p".into(), proto.clone()]);
     }

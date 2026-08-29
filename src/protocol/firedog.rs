@@ -205,6 +205,12 @@ pub struct AddRulePayload {
     pub dst_port: Option<u16>,
     pub action: String,             // DROP | REJECT | ACCEPT | LOG
     pub comment: Option<String>,
+    /// NIC specifica (es. eth0) su cui applicare la regola — supporto host
+    /// multi-interfaccia. None/assente = tutto l'host (comportamento storico).
+    /// Applicata come -i su chain INPUT, -o su OUTPUT (il backend rifiuta
+    /// interface su FORWARD prima di arrivare qui: ambiguo senza sapere se
+    /// intende il lato in o out).
+    pub interface: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
