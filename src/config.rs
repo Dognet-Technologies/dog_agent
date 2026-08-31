@@ -124,6 +124,12 @@ pub struct TargetConfig {
     #[serde(default)]
     pub collectors: CollectorsConfig,
 
+    /// Percorso del file JSON prodotto da Laurel (plugin auditd) sul target.
+    /// Se impostato, l'agent lo tail-a e inoltra gli eventi arricchiti al server
+    /// come `SecurityEvents`. Se `None`, l'inoltro eventi è disattivato.
+    #[serde(default)]
+    pub laurel_log_path: Option<String>,
+
     // ── Condiviso ─────────────────────────────────────────────────────────────
 
     /// Impostazioni di reconnessione con backoff esponenziale

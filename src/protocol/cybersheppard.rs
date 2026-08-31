@@ -30,6 +30,14 @@ pub enum AgentMessage {
         payload: CompressedPayload,
     },
 
+    /// Batch di eventi di sicurezza (auditd arricchiti da Laurel), compressi.
+    /// Il payload è `base64(zstd(json(Vec<evento>)))`, come le metriche.
+    SecurityEvents {
+        target_id: i32,
+        timestamp: i64,
+        payload: CompressedPayload,
+    },
+
     /// Risposta a un comando del server
     CommandResponse {
         target_id: i32,

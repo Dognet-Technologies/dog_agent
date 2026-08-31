@@ -70,6 +70,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
     send_timer.tick().await;
 
     let mut buffer: Vec<AllMetrics> = Vec::new();
+    let mut laurel_offset: u64 = 0;
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -95,6 +96,19 @@ async fn session(config: &TargetConfig) -> Result<()> {
             _ = send_timer.tick() => {
                 if !buffer.is_empty() {
                     flush_buffer(config, &mut tx, &mut buffer, target_id).await?;
+                }
+                // Inoltro eventi Laurel (se configurato laurel_log_path)
+                if let Some(path) = config.laurel_log_path.clone() {
+                    let off = laurel_offset;
+                    match tokio::task::spawn_blocking(move || read_laurel_events(&path, off)).await {
+                        Ok((events, new_off)) => {
+                            laurel_offset = new_off;
+                            if !events.is_empty() {
+                                flush_security_events(config, &mut tx, events, target_id).await?;
+                            }
+                        }
+                        Err(e) => error!("[{}] Errore lettura Laurel: {}", config.name, e),
+                    }
                 }
             }
 
@@ -186,6 +200,73 @@ where
     tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
     buffer.clear();
     Ok(())
+}
+
+/// Comprime e invia un batch di eventi Laurel come `SecurityEvents`.
+async fn flush_security_events<S>(
+    config: &TargetConfig,
+    tx: &mut S,
+    events: Vec<serde_json::Value>,
+    target_id: i32,
+) -> Result<()>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let compressed = compress_json(&events, config.compression_level)?;
+
+    info!(
+        "[{}] Invio {} eventi Laurel — {} → {} byte ({:.1}% compressione)",
+        config.name,
+        events.len(),
+        compressed.original_size,
+        compressed.compressed_size,
+        compressed.compression_ratio
+    );
+
+    let msg = AgentMessage::SecurityEvents {
+        target_id,
+        timestamp: chrono::Utc::now().timestamp(),
+        payload: compressed,
+    };
+    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+    Ok(())
+}
+
+/// Tail del file JSON di Laurel: legge le righe nuove da `offset`, ne fa il
+/// parse (una riga = un evento arricchito) e restituisce `(eventi, nuovo_offset)`.
+/// Gestisce la rotazione (se il file è più corto di `offset`, riparte da 0).
+/// Funzione bloccante: eseguirla in `spawn_blocking`.
+fn read_laurel_events(path: &str, offset: u64) -> (Vec<serde_json::Value>, u64) {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (Vec::new(), offset),
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = if len < offset { 0 } else { offset };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (Vec::new(), offset);
+    }
+
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    let mut pos = start;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        pos += line.len() as u64 + 1; // +1 per il newline
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            events.push(v);
+        }
+    }
+    (events, pos)
 }
 
 async fn handle_server_message<S>(
