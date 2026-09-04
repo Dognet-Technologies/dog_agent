@@ -39,7 +39,7 @@ pub async fn run(config: TargetConfig) -> Result<()> {
 
 async fn session(config: &TargetConfig) -> Result<()> {
     let (ws, _) = connect_async(config.ws_url()).await?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut ws_tx, mut rx) = ws.split();
 
     let target_id = config.target_id.unwrap_or(0);
     let hostname = hostname::get()
@@ -66,7 +66,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
             },
         };
-        tx.send(Message::Text(serde_json::to_string(&pair)?)).await?;
+        ws_tx.send(Message::Text(serde_json::to_string(&pair)?)).await?;
         info!("[{}] pair_request inviato", config.name);
         wait_pairing(&mut rx, &config.name).await?;
         info!("[{}] Pairing completato", config.name);
@@ -80,10 +80,25 @@ async fn session(config: &TargetConfig) -> Result<()> {
                 hostname: hostname.clone(),
             },
         };
-        tx.send(Message::Text(serde_json::to_string(&auth)?)).await?;
+        ws_tx.send(Message::Text(serde_json::to_string(&auth)?)).await?;
         wait_auth_ack(&mut rx, &config.name).await?;
         info!("[{}] Autenticazione completata", config.name);
     }
+
+    // ── Writer task dedicato ────────────────────────────────────────────────
+    // I write eseguiti direttamente dal select! su uno SplitSink di
+    // tokio-tungstenite non venivano "guidati" in modo affidabile quando non si
+    // stava contemporaneamente pollando il read half: le risposte out-of-band
+    // (es. esito hardening) restavano in coda per decine di secondi. Un task
+    // dedicato che possiede il sink e lo polla di continuo elimina il ritardo.
+    let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    tokio::spawn(async move {
+        while let Some(m) = out_rx.recv().await {
+            if ws_tx.send(m).await.is_err() {
+                break;
+            }
+        }
+    });
 
     // ── Setup timer ───────────────────────────────────────────────────────────
     let mut collect_timer = interval(Duration::from_secs(config.collection_interval));
@@ -107,7 +122,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
                         // Flush forzato se buffer pieno
                         if buffer.len() >= config.max_buffer_size {
                             warn!("[{}] Buffer pieno, flush immediato", config.name);
-                            flush_buffer(config, &mut tx, &mut buffer, target_id).await?;
+                            flush_buffer(config, &out, &mut buffer, target_id)?;
                         }
                     }
                     Err(e) => {
@@ -118,7 +133,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
 
             _ = send_timer.tick() => {
                 if !buffer.is_empty() {
-                    flush_buffer(config, &mut tx, &mut buffer, target_id).await?;
+                    flush_buffer(config, &out, &mut buffer, target_id)?;
                 }
                 // Inoltro eventi Laurel (se configurato laurel_log_path)
                 if let Some(path) = config.laurel_log_path.clone() {
@@ -127,7 +142,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
                         Ok((events, new_off)) => {
                             laurel_offset = new_off;
                             if !events.is_empty() {
-                                flush_security_events(config, &mut tx, events, target_id).await?;
+                                flush_security_events(config, &out, events, target_id)?;
                             }
                         }
                         Err(e) => error!("[{}] Errore lettura Laurel: {}", config.name, e),
@@ -138,10 +153,10 @@ async fn session(config: &TargetConfig) -> Result<()> {
             msg = rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_server_message(config, &mut tx, &text, target_id).await?;
+                        handle_server_message(config, &out, &text, target_id).await?;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        tx.send(Message::Pong(data)).await?;
+                        out.send(Message::Pong(data)).map_err(|e| anyhow::anyhow!("channel: {}", e))?;
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("[{}] Server ha chiuso la connessione", config.name);
@@ -244,15 +259,12 @@ where
         .map_err(|_| anyhow::anyhow!("Timeout autenticazione (30s)"))?
 }
 
-async fn flush_buffer<S>(
+fn flush_buffer(
     config: &TargetConfig,
-    tx: &mut S,
+    out: &tokio::sync::mpsc::UnboundedSender<Message>,
     buffer: &mut Vec<AllMetrics>,
     target_id: i32,
-) -> Result<()>
-where
-    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
+) -> Result<()> {
     let compressed = compress_json(&*buffer, config.compression_level)?;
 
     info!(
@@ -270,21 +282,19 @@ where
         payload: compressed,
     };
 
-    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+    out.send(Message::Text(serde_json::to_string(&msg)?))
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
     buffer.clear();
     Ok(())
 }
 
 /// Comprime e invia un batch di eventi Laurel come `SecurityEvents`.
-async fn flush_security_events<S>(
+fn flush_security_events(
     config: &TargetConfig,
-    tx: &mut S,
+    out: &tokio::sync::mpsc::UnboundedSender<Message>,
     events: Vec<serde_json::Value>,
     target_id: i32,
-) -> Result<()>
-where
-    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
+) -> Result<()> {
     let compressed = compress_json(&events, config.compression_level)?;
 
     info!(
@@ -301,7 +311,8 @@ where
         timestamp: chrono::Utc::now().timestamp(),
         payload: compressed,
     };
-    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+    out.send(Message::Text(serde_json::to_string(&msg)?))
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
     Ok(())
 }
 
@@ -342,15 +353,12 @@ fn read_laurel_events(path: &str, offset: u64) -> (Vec<serde_json::Value>, u64) 
     (events, pos)
 }
 
-async fn handle_server_message<S>(
+async fn handle_server_message(
     config: &TargetConfig,
-    tx: &mut S,
+    out: &tokio::sync::mpsc::UnboundedSender<Message>,
     text: &str,
     target_id: i32,
-) -> Result<()>
-where
-    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
+) -> Result<()> {
     let msg: ServerMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
@@ -366,21 +374,26 @@ where
         ServerMessage::Command { payload, .. } => {
             info!("[{}] Comando ricevuto: {}", config.name, payload.action);
 
-            // CyberSheppard non gestisce firewall, i comandi riguardano
-            // la configurazione dei collector o operazioni di sistema.
-            let (success, output, error) = execute_command(&payload).await;
-
-            let resp = AgentMessage::CommandResponse {
-                target_id,
-                timestamp: chrono::Utc::now().timestamp(),
-                payload: CommandResponsePayload {
-                    command_id: payload.command_id,
-                    success,
-                    output,
-                    error,
-                },
-            };
-            tx.send(Message::Text(serde_json::to_string(&resp)?)).await?;
+            if payload.action == "execute_hardening" {
+                // Applica (o simula) un template di hardening e riporta lo stato
+                // come command_response con payload HardeningResponse.
+                run_hardening_command(config, out, target_id, &payload.params).await?;
+            } else {
+                // Altri comandi (ping/get_version): risposta generica.
+                let (success, output, error) = execute_command(&payload).await;
+                let resp = AgentMessage::CommandResponse {
+                    target_id,
+                    timestamp: chrono::Utc::now().timestamp(),
+                    payload: CommandResponsePayload {
+                        command_id: payload.command_id,
+                        success,
+                        output,
+                        error,
+                    },
+                };
+                out.send(Message::Text(serde_json::to_string(&resp)?))
+                    .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+            }
         }
         ServerMessage::AuthAck { .. } => {
             // già gestito in wait_auth_ack
@@ -390,6 +403,79 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// Esegue (o simula) un template di hardening ricevuto via comando e riporta
+/// lo stato al server come `command_response` con payload HardeningResponse.
+/// L'esecuzione vera è bloccante → gira in spawn_blocking.
+async fn run_hardening_command(
+    config: &TargetConfig,
+    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    target_id: i32,
+    params: &serde_json::Value,
+) -> Result<()> {
+    let exec_id = params.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let mode = params
+        .get("execution_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dry_run")
+        .to_string();
+    let template = params.get("template").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let total = template
+        .get("hardening_steps")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0) as i32;
+
+    info!("[{}] Hardening exec {} ({}) — {} controlli", config.name, exec_id, mode, total);
+
+    // Stato iniziale "running".
+    send_hardening_status(
+        out, target_id, exec_id, "running",
+        Some(serde_json::json!({ "total_controls": total, "successful_controls": 0, "failed_controls": 0 })),
+        None,
+    )?;
+
+    // Esecuzione bloccante (std::fs / std::process).
+    let outcome = tokio::task::spawn_blocking(move || super::hardening::run_hardening(&template, &mode))
+        .await
+        .map_err(|e| anyhow::anyhow!("join hardening: {}", e))?;
+
+    let progress = serde_json::json!({
+        "total_controls": outcome.total_controls,
+        "successful_controls": outcome.successful_controls,
+        "failed_controls": outcome.failed_controls,
+        "execution_log": outcome.execution_log,
+        "rollback_data": outcome.rollback_data,
+    });
+    send_hardening_status(out, target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref())?;
+    info!("[{}] Hardening exec {} → {}", config.name, exec_id, outcome.status);
+    Ok(())
+}
+
+fn send_hardening_status(
+    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    target_id: i32,
+    execution_id: i64,
+    status: &str,
+    progress: Option<serde_json::Value>,
+    error: Option<&str>,
+) -> Result<()> {
+    let msg = serde_json::json!({
+        "msg_type": "command_response",
+        "target_id": target_id,
+        "timestamp": chrono::Utc::now().timestamp(),
+        "payload": {
+            "execution_id": execution_id,
+            "status": status,
+            "progress": progress,
+            "error": error,
+        }
+    });
+    // Inviato via canale al writer task dedicato (flush affidabile e immediato).
+    out.send(Message::Text(msg.to_string()))
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
     Ok(())
 }
 
