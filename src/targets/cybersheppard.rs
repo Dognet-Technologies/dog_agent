@@ -437,10 +437,29 @@ async fn run_hardening_command(
         None,
     )?;
 
-    // Esecuzione bloccante (std::fs / std::process).
-    let outcome = tokio::task::spawn_blocking(move || super::hardening::run_hardening(&template, &mode))
-        .await
-        .map_err(|e| anyhow::anyhow!("join hardening: {}", e))?;
+    // Esecuzione bloccante con streaming del progresso: dopo ogni controllo
+    // l'executor emette un ProgressUpdate (con log parziale) che inoltriamo
+    // subito al server come stato "running" → l'UI mostra cosa sta accadendo.
+    let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<super::hardening::ProgressUpdate>();
+    let handle = tokio::task::spawn_blocking(move || {
+        super::hardening::run_hardening(&template, &mode, move |u| {
+            let _ = ptx.send(u);
+        })
+    });
+    while let Some(u) = prx.recv().await {
+        send_hardening_status(
+            out, target_id, exec_id, "running",
+            Some(serde_json::json!({
+                "total_controls": u.total,
+                "successful_controls": u.successful,
+                "failed_controls": u.failed,
+                "current_control": u.current_control,
+                "execution_log": u.log,
+            })),
+            None,
+        )?;
+    }
+    let outcome = handle.await.map_err(|e| anyhow::anyhow!("join hardening: {}", e))?;
 
     let progress = serde_json::json!({
         "total_controls": outcome.total_controls,

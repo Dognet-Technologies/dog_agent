@@ -24,9 +24,24 @@ pub struct HardeningOutcome {
     pub error: Option<String>,
 }
 
+/// Aggiornamento di avanzamento emesso dopo ogni controllo, così il server/UI
+/// mostra in tempo reale cosa sta accadendo (log parziale incluso).
+#[derive(Clone)]
+pub struct ProgressUpdate {
+    pub total: i32,
+    pub successful: i32,
+    pub failed: i32,
+    pub current_control: String,
+    pub log: String,
+}
+
 /// Punto d'ingresso: applica (o simula) il template. Funzione bloccante:
-/// va chiamata in `spawn_blocking`.
-pub fn run_hardening(template: &Value, mode: &str) -> HardeningOutcome {
+/// va chiamata in `spawn_blocking`. `on_progress` è invocata dopo ogni controllo.
+pub fn run_hardening(
+    template: &Value,
+    mode: &str,
+    mut on_progress: impl FnMut(ProgressUpdate),
+) -> HardeningOutcome {
     let dry = mode != "apply";
     let os_family = detect_os_family();
     let mut log = String::new();
@@ -85,6 +100,16 @@ pub fn run_hardening(template: &Value, mode: &str) -> HardeningOutcome {
         }
 
         if control_ok { ok_controls += 1; } else { failed_controls += 1; }
+
+        // Notifica l'avanzamento (log parziale) dopo ogni controllo.
+        info!("Hardening: controllo '{}' → {}/{} ok, {} falliti", cname, ok_controls, total, failed_controls);
+        on_progress(ProgressUpdate {
+            total,
+            successful: ok_controls,
+            failed: failed_controls,
+            current_control: cname.to_string(),
+            log: log.clone(),
+        });
     }
 
     // L'esecuzione è "completed" se è arrivata in fondo: i controlli falliti sono
@@ -286,18 +311,27 @@ fn act_package_install(task: &Value, dry: bool) -> Result<String, String> {
         .unwrap_or_default();
     if pkgs.is_empty() { return Err("packages vuoto".into()); }
     if dry { return Ok(format!("installerebbe: {}", pkgs.join(", "))); }
-    let (bin, base): (&str, Vec<&str>) = match detect_pkg_mgr().as_str() {
-        "apt" => ("apt-get", vec!["install", "-y"]),
-        "zypper" => ("zypper", vec!["--non-interactive", "install"]),
-        "dnf" => ("dnf", vec!["install", "-y"]),
+    let list = pkgs.join(" ");
+    // Non-interattivo + timeout di rete, per non restare appesi (es. mirror
+    // irraggiungibili). Il timeout complessivo del task fa da rete di sicurezza.
+    let cmdline = match detect_pkg_mgr().as_str() {
+        "apt" => format!(
+            "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=30 install -y {}",
+            list
+        ),
+        "zypper" => format!("zypper --non-interactive install {}", list),
+        "dnf" => format!("dnf install -y --setopt=timeout=20 {}", list),
         m => return Err(format!("package manager non supportato: {}", m)),
     };
-    let mut cmd = Command::new(bin);
-    cmd.args(&base);
-    for p in &pkgs { cmd.arg(p); }
-    let status = cmd.status().map_err(|e| format!("{}: {}", bin, e))?;
-    if !status.success() { return Err(format!("install {} fallito", pkgs.join(", "))); }
-    Ok(format!("installati: {}", pkgs.join(", ")))
+    let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(180);
+    let (code, out, timed_out) = run_shell(&cmdline, secs);
+    if timed_out {
+        return Err(format!("timeout install {} dopo {}s (mirror irraggiungibile?)", list, secs));
+    }
+    if code != 0 {
+        return Err(format!("install {} fallito (exit {}): {}", list, code, out.lines().last().unwrap_or("")));
+    }
+    Ok(format!("installati: {}", list))
 }
 
 fn act_cron(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
@@ -342,11 +376,13 @@ fn act_command(task: &Value, dry: bool) -> Result<String, String> {
     let cmd = s(task, "command").ok_or("command mancante")?;
     let expected = task.get("expected_exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
     if dry { return Ok(format!("eseguirebbe: {}", first_line(cmd))); }
-    let out = Command::new("bash").arg("-c").arg(cmd).output().map_err(|e| format!("exec: {}", e))?;
-    let code = out.status.code().unwrap_or(-1) as i64;
-    if code != expected {
-        return Err(format!("exit {} (atteso {}): {}", code, expected,
-            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("")));
+    let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
+    let (code, out, timed_out) = run_shell(cmd, secs);
+    if timed_out {
+        return Err(format!("timeout dopo {}s: {}", secs, first_line(cmd)));
+    }
+    if code as i64 != expected {
+        return Err(format!("exit {} (atteso {}): {}", code, expected, out.lines().last().unwrap_or("")));
     }
     Ok(format!("comando ok (exit {})", code))
 }
@@ -354,11 +390,80 @@ fn act_command(task: &Value, dry: bool) -> Result<String, String> {
 fn act_script(task: &Value, dry: bool) -> Result<String, String> {
     let script = s(task, "script").ok_or("script mancante")?;
     if dry { return Ok(format!("eseguirebbe script ({} righe)", script.lines().count())); }
-    let out = Command::new("bash").arg("-c").arg(script).output().map_err(|e| format!("exec: {}", e))?;
-    if !out.status.success() {
-        return Err(format!("script exit {}", out.status.code().unwrap_or(-1)));
-    }
+    let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
+    let (code, _out, timed_out) = run_shell(script, secs);
+    if timed_out { return Err(format!("timeout dopo {}s", secs)); }
+    if code != 0 { return Err(format!("script exit {}", code)); }
     Ok("script ok".into())
+}
+
+static SHELL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Esegue un comando shell con timeout robusto. Punto chiave: l'output NON viene
+/// convogliato in una pipe verso l'agent ma REINDIRIZZATO su un file, così i
+/// figli orfani (es. i "method" di apt che sopravvivono al gruppo) non possono
+/// bloccare la raccolta dell'output. Allo scadere del timeout si uccide il
+/// process-group (best-effort) e comunque il processo diretto → l'agent prosegue.
+/// Ritorna (exit_code, output, timed_out).
+fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // Tetto assoluto per non far bloccare un singolo task troppo a lungo
+    // (es. template con timeout molto alti su operazioni di rete). Override via
+    // HARDENING_TASK_MAX_SECS. Default 300s.
+    let max_secs = std::env::var("HARDENING_TASK_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    let timeout_secs = timeout_secs.min(max_secs);
+
+    let seq = SHELL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = format!("/tmp/cs-hardening-{}-{}.out", std::process::id(), seq);
+    // Redirect a file + stdin da /dev/null (niente prompt interattivi).
+    let full = format!("{{ {} ; }} </dev/null >{} 2>&1", cmd, tmp);
+
+    let spawn = Command::new("bash")
+        .arg("-c")
+        .arg(&full)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => return (-1, format!("spawn error: {}", e), false),
+    };
+    let pid = child.id() as i32;
+    let start = Instant::now();
+    let mut timed_out = false;
+    let mut code = -1;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                code = st.code().unwrap_or(-1);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() >= Duration::from_secs(timeout_secs) {
+                    timed_out = true;
+                    // Best-effort: uccide il gruppo (bash + figli); poi il diretto.
+                    let _ = Command::new("kill").arg("-9").arg(format!("-{}", pid)).status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(_) => break,
+        }
+    }
+    let out = std::fs::read_to_string(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    (code, out, timed_out)
 }
 
 // ── util ─────────────────────────────────────────────────────────────────────
