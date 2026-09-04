@@ -16,11 +16,21 @@ use crate::compression::CompressedPayload;
 #[derive(Debug, Serialize)]
 #[serde(tag = "msg_type", rename_all = "snake_case")]
 pub enum AgentMessage {
-    /// Autenticazione iniziale
+    /// Autenticazione iniziale (legacy, a token)
     Auth {
         target_id: i32,
         timestamp: i64,
         payload: AuthPayload,
+    },
+
+    /// Pairing per-identità (stile FireDog): il server calcola
+    /// SHA512(ip+hostname+mac) e lo confronta con l'identità registrata,
+    /// oltre a verificare l'api_key. `target_id` può essere 0 (ignorato:
+    /// il target è risolto per identità).
+    PairRequest {
+        target_id: i32,
+        timestamp: i64,
+        payload: PairRequestPayload,
     },
 
     /// Batch di metriche compresse con Zstd
@@ -69,6 +79,23 @@ pub enum ServerMessage {
 
     /// Conferma ricezione metriche
     MetricsAck,
+
+    /// Esito del pairing per-identità (stile FireDog). Inviato una o due volte
+    /// (fase 1 poi fase 2, oppure un unico messaggio con entrambe verificate).
+    PairingStatus {
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        phase: u8,
+        #[serde(default)]
+        phase_1_verified: bool,
+        #[serde(default)]
+        phase_2_verified: bool,
+        #[serde(default)]
+        target_id: Option<i32>,
+        #[serde(default)]
+        message: Option<String>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +107,15 @@ pub struct AuthPayload {
     pub auth_token: String,
     pub agent_version: String,
     pub hostname: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairRequestPayload {
+    pub api_key: String,
+    pub ip: String,
+    pub hostname: String,
+    pub mac: String,
+    pub agent_version: String,
 }
 
 #[derive(Debug, Deserialize)]

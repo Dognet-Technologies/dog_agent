@@ -46,21 +46,44 @@ async fn session(config: &TargetConfig) -> Result<()> {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // ── Autenticazione ────────────────────────────────────────────────────────
-    let auth = AgentMessage::Auth {
-        target_id,
-        timestamp: chrono::Utc::now().timestamp(),
-        payload: AuthPayload {
-            auth_token: config.api_key.clone(),
-            agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            hostname: hostname.clone(),
-        },
-    };
-    tx.send(Message::Text(serde_json::to_string(&auth)?)).await?;
+    // ── Autenticazione / Pairing ────────────────────────────────────────────────
+    // Se l'identità (ip+hostname+mac) è configurata, si usa il pairing per-identità
+    // stile FireDog; altrimenti si ricade sull'auth a token (legacy).
+    let ip = config.ip.clone().unwrap_or_default();
+    let cfg_hostname = config.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| hostname.clone());
+    let mac = config.mac.clone().unwrap_or_default();
+    let use_pairing = !ip.is_empty() && !cfg_hostname.is_empty() && !mac.is_empty();
 
-    // Attendi AuthAck
-    wait_auth_ack(&mut rx, &config.name).await?;
-    info!("[{}] Autenticazione completata", config.name);
+    if use_pairing {
+        let pair = AgentMessage::PairRequest {
+            target_id,
+            timestamp: chrono::Utc::now().timestamp(),
+            payload: PairRequestPayload {
+                api_key: config.api_key.clone(),
+                ip,
+                hostname: cfg_hostname,
+                mac,
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        };
+        tx.send(Message::Text(serde_json::to_string(&pair)?)).await?;
+        info!("[{}] pair_request inviato", config.name);
+        wait_pairing(&mut rx, &config.name).await?;
+        info!("[{}] Pairing completato", config.name);
+    } else {
+        let auth = AgentMessage::Auth {
+            target_id,
+            timestamp: chrono::Utc::now().timestamp(),
+            payload: AuthPayload {
+                auth_token: config.api_key.clone(),
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                hostname: hostname.clone(),
+            },
+        };
+        tx.send(Message::Text(serde_json::to_string(&auth)?)).await?;
+        wait_auth_ack(&mut rx, &config.name).await?;
+        info!("[{}] Autenticazione completata", config.name);
+    }
 
     // ── Setup timer ───────────────────────────────────────────────────────────
     let mut collect_timer = interval(Duration::from_secs(config.collection_interval));
@@ -134,6 +157,56 @@ async fn session(config: &TargetConfig) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Attende l'esito del pairing per-identità (fino a 3 min, finestra server).
+/// Ritorna Ok solo quando fase 1 (api_key) e fase 2 (identity hash) sono
+/// entrambe verificate; fallisce su status "failed"/"expired".
+async fn wait_pairing<S>(rx: &mut S, name: &str) -> Result<()>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut phase1 = false;
+
+    let timeout = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match rx.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(ServerMessage::PairingStatus {
+                            status,
+                            phase_1_verified,
+                            phase_2_verified,
+                            message,
+                            ..
+                        }) => {
+                            if phase_1_verified {
+                                phase1 = true;
+                                info!("[{}] Fase 1 verificata (API key OK)", name);
+                            }
+                            if phase_2_verified && phase1 {
+                                info!("[{}] Fase 2 verificata (identity hash OK)", name);
+                                return Ok(());
+                            }
+                            if status == "failed" || status == "expired" {
+                                anyhow::bail!("Pairing fallito: {}", message.unwrap_or(status));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("[{}] Messaggio non parsato durante pairing: {}", name, e),
+                    }
+                }
+                Some(Ok(Message::Close(_))) => anyhow::bail!("Connessione chiusa durante pairing"),
+                Some(Err(e)) => return Err(e.into()),
+                None => anyhow::bail!("Stream terminato durante pairing"),
+                _ => {}
+            }
+        }
+    });
+
+    timeout
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout pairing (180s)"))?
+}
 
 async fn wait_auth_ack<S>(rx: &mut S, name: &str) -> Result<()>
 where
@@ -311,6 +384,9 @@ where
         }
         ServerMessage::AuthAck { .. } => {
             // già gestito in wait_auth_ack
+        }
+        ServerMessage::PairingStatus { .. } => {
+            // già gestito in wait_pairing, ignora eventuali duplicati
         }
     }
 
