@@ -39,6 +39,19 @@ LogsDirectoryMode=0755
 # scrivibile anche sotto ProtectSystem=strict.
 ReadWritePaths=/run/xtables.lock
 ReadWritePaths=-/opt/sentinelsuite/firedog/export
+# Applicazione dei template di hardening: l'agent scrive la configurazione di
+# sistema. Manteniamo ProtectSystem=strict (a protezione di /usr, /boot, /bin,
+# /sbin, /lib) e concediamo in scrittura SOLO i path che l'hardening tocca:
+#   /etc       → sysctl.d, modprobe.d, ssh, ssl, fstab, sudoers.d, security,
+#                cron.d, audit, systemd, limits.conf, modules-load.d, ...
+#   /usr/local → script installati dai template (es. /usr/local/bin/*.sh)
+#   /var       → directory di backup/report e stato (es. /var/backups, /var/log)
+# NB: i task package_install (che scrivono in /usr) restano bloccati dalla
+# sandbox e vengono riportati come falliti — scelta consapevole; per gli
+# ambienti che li richiedono va previsto un meccanismo separato/privilegiato.
+ReadWritePaths=/etc
+ReadWritePaths=/usr/local
+ReadWritePaths=/var
 PrivateTmp=true
 
 # Logging
