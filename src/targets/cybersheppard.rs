@@ -467,6 +467,7 @@ async fn run_hardening_command(
         "failed_controls": outcome.failed_controls,
         "execution_log": outcome.execution_log,
         "rollback_data": outcome.rollback_data,
+        "control_results": outcome.control_results,
     });
     send_hardening_status(out, target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref())?;
     info!("[{}] Hardening exec {} → {}", config.name, exec_id, outcome.status);

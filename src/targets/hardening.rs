@@ -22,6 +22,10 @@ pub struct HardeningOutcome {
     pub execution_log: String,
     pub rollback_data: Value,
     pub error: Option<String>,
+    /// Esito per-controllo `[{"control_id": "<slug YAML>", "ok": bool}]`, usato
+    /// dal server per aggiornare `target_control_status` via
+    /// `hardening_template_controls`.
+    pub control_results: Vec<Value>,
 }
 
 /// Aggiornamento di avanzamento emesso dopo ogni controllo, così il server/UI
@@ -55,6 +59,7 @@ pub fn run_hardening(
     let total = steps.len() as i32;
     let mut ok_controls = 0i32;
     let mut failed_controls = 0i32;
+    let mut control_results: Vec<Value> = Vec::with_capacity(steps.len());
 
     for step in &steps {
         let cname = step.get("control_id").and_then(|v| v.as_str())
@@ -100,6 +105,7 @@ pub fn run_hardening(
         }
 
         if control_ok { ok_controls += 1; } else { failed_controls += 1; }
+        control_results.push(json!({ "control_id": cname, "ok": control_ok }));
 
         // Notifica l'avanzamento (log parziale) dopo ogni controllo.
         info!("Hardening: controllo '{}' → {}/{} ok, {} falliti", cname, ok_controls, total, failed_controls);
@@ -127,6 +133,7 @@ pub fn run_hardening(
         execution_log: log,
         rollback_data: json!({ "mode": mode, "files": file_backups }),
         error: None,
+        control_results,
     }
 }
 
