@@ -214,20 +214,102 @@ fn act_file_copy(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<St
     Ok(format!("copiato → {}", dest))
 }
 
+/// Assicura che una o più righe siano presenti in un file. Supporta sia
+/// `line` (singola) sia `lines` (array — es. le due righe PAM preauth+authfail
+/// di pam_faillock, che vanno inserite insieme da un solo task) e, opzionali:
+/// - `anchor`+`position` ("before"|"after"): inserisce vicino alla prima riga
+///   che soddisfa il pattern regex `anchor`, invece che in fondo al file;
+/// - `replace_regex`: se una riga esistente combacia, viene SOSTITUITA con la
+///   nuova invece di aggiungerne una seconda (usato per parametri con default
+///   già presenti nel file, es. PASS_MAX_DAYS in /etc/login.defs);
+/// - `comment`: riga di commento inserita una volta sola sopra il blocco
+///   aggiunto (ignorata se non si aggiunge nulla, es. tutto già presente).
 fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "file").ok_or("file mancante")?;
-    let line = s(task, "line").ok_or("line mancante")?;
-    let existing = std::fs::read_to_string(file).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == line.trim()) {
-        return Ok(format!("riga già presente in {}", file));
+
+    let mut wanted: Vec<String> = Vec::new();
+    if let Some(l) = s(task, "line") {
+        wanted.push(l.to_string());
     }
-    if dry { return Ok(format!("aggiungerebbe riga a {}", file)); }
+    if let Some(arr) = task.get("lines").and_then(|v| v.as_array()) {
+        wanted.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+    if wanted.is_empty() {
+        return Err("line mancante".to_string());
+    }
+
+    let replace_regex = task.get("replace_regex").and_then(|v| v.as_str());
+    let anchor_re = task
+        .get("anchor")
+        .and_then(|v| v.as_str())
+        .and_then(|pat| regex::Regex::new(pat).ok());
+    let position_before = task.get("position").and_then(|v| v.as_str()) == Some("before");
+    let comment = task.get("comment").and_then(|v| v.as_str());
+
+    let existing = std::fs::read_to_string(file).unwrap_or_default();
+    let mut out: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut inserted = 0usize;
+    let mut replaced = 0usize;
+    let mut already = 0usize;
+
+    for want in &wanted {
+        if out.iter().any(|l| l.trim() == want.trim()) {
+            already += 1;
+            continue;
+        }
+
+        if let Some(pattern) = replace_regex {
+            // Il pattern è condiviso da tutte le `wanted` (es. una alternanza
+            // "^(A|B|C)\s+.*" per un intero gruppo di parametri): non basta il
+            // primo match, va anche la stessa "chiave" (prima parola) della
+            // riga desiderata, altrimenti una entry rimpiazzerebbe quella di
+            // un'altra chiave già sostituita in questo stesso giro.
+            let key = want.split_whitespace().next();
+            if let Ok(re) = regex::Regex::new(pattern) {
+                let idx = out
+                    .iter()
+                    .position(|l| re.is_match(l) && l.split_whitespace().next() == key);
+                if let Some(idx) = idx {
+                    out[idx] = want.clone();
+                    replaced += 1;
+                    continue;
+                }
+            }
+        }
+
+        let mut insert_at = anchor_re
+            .as_ref()
+            .and_then(|re| out.iter().position(|l| re.is_match(l)))
+            .map(|idx| if position_before { idx } else { idx + 1 })
+            .unwrap_or(out.len());
+
+        if inserted == 0 {
+            if let Some(c) = comment {
+                out.insert(insert_at.min(out.len()), c.to_string());
+                insert_at += 1;
+            }
+        }
+        out.insert(insert_at.min(out.len()), want.clone());
+        inserted += 1;
+    }
+
+    if inserted == 0 && replaced == 0 {
+        return Ok(format!("{} riga/e già presenti in {}", already, file));
+    }
+    if dry {
+        return Ok(format!(
+            "aggiornerebbe {} ({} da aggiungere, {} da sostituire)",
+            file, inserted, replaced
+        ));
+    }
     record_backup(backups, file);
-    let mut new = existing;
-    if !new.is_empty() && !new.ends_with('\n') { new.push('\n'); }
-    new.push_str(line); new.push('\n');
-    std::fs::write(file, new).map_err(|e| format!("write {}: {}", file, e))?;
-    Ok(format!("riga aggiunta a {}", file))
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    std::fs::write(file, joined).map_err(|e| format!("write {}: {}", file, e))?;
+    Ok(format!(
+        "{} ({} aggiunte, {} sostituite)",
+        file, inserted, replaced
+    ))
 }
 
 fn act_file_line_replace(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
@@ -518,4 +600,100 @@ fn eval_condition(cond: &str, os_family: &str) -> bool {
     // Condizione sconosciuta → non blocca (applica).
     warn!("condizione hardening non riconosciuta, la tratto come vera: {}", cond);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// File temporaneo che si autoelimina all'uscita dallo scope (Drop).
+    struct TmpFile(String);
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn tmp_file(content: &str) -> (TmpFile, String) {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("dog-agent-test-{}-{}", std::process::id(), seq))
+            .to_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(&path, content).unwrap();
+        (TmpFile(path.clone()), path)
+    }
+
+    #[test]
+    fn inserisce_piu_righe_dallo_stesso_task_lines() {
+        let (_f, path) = tmp_file("auth required pam_unix.so\n");
+        let task = json!({
+            "file": path,
+            "lines": [
+                "auth required pam_faillock.so preauth silent audit deny=5",
+                "auth [default=die] pam_faillock.so authfail audit deny=5",
+            ],
+        });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg.contains("2 aggiunte"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("pam_faillock.so preauth"));
+        assert!(content.contains("pam_faillock.so authfail"));
+
+        // Idempotente: rieseguendo non aggiunge duplicati.
+        let msg2 = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg2.contains("2 riga/e già presenti"));
+    }
+
+    #[test]
+    fn sostituisce_righe_esistenti_con_replace_regex() {
+        let (_f, path) = tmp_file("PASS_MAX_DAYS   99999\nPASS_MIN_DAYS   0\n");
+        let task = json!({
+            "file": path,
+            "lines": ["PASS_MAX_DAYS    90", "PASS_MIN_DAYS    1", "PASS_WARN_AGE    14"],
+            "replace_regex": "^(PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_WARN_AGE)\\s+.*",
+        });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg.contains("2 sostituite"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("PASS_MAX_DAYS    90"));
+        assert!(content.contains("PASS_MIN_DAYS    1"));
+        // PASS_WARN_AGE non esisteva già: niente da sostituire, va aggiunta in fondo.
+        assert!(content.contains("PASS_WARN_AGE    14"));
+    }
+
+    #[test]
+    fn inserisce_prima_dell_anchor_con_commento() {
+        let (_f, path) = tmp_file("account [success=1] pam_unix.so\naccount requisite pam_deny.so\n");
+        let task = json!({
+            "file": path,
+            "line": "account required pam_faillock.so",
+            "anchor": "account.*pam_unix.so",
+            "position": "before",
+            "comment": "# hardening",
+        });
+        let mut backups = Vec::new();
+        act_file_line_present(&task, false, &mut backups).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "# hardening");
+        assert_eq!(lines[1], "account required pam_faillock.so");
+        assert_eq!(lines[2], "account [success=1] pam_unix.so");
+    }
+
+    #[test]
+    fn dry_run_non_scrive_nulla() {
+        let (_f, path) = tmp_file("");
+        let task = json!({ "file": path, "line": "test" });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, true, &mut backups).unwrap();
+        assert!(msg.contains("aggiornerebbe"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
 }
