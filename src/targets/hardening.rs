@@ -138,10 +138,10 @@ pub fn run_hardening(
 }
 
 /// Esito dell'applicazione di UN task ad-hoc (non un template intero) — usato
-/// dal motore di remediation curata: un check LSA con una entry in
-/// `lsa_check_remediation_map` viene risolto a un singolo task della stessa
+/// dal motore di remediation curata: un check con una entry in
+/// `security_audit_remediations` viene risolto a un singolo task della stessa
 /// DSL usata dai template (stesse azioni, stesso `apply_task`), non
-/// all'esecuzione del testo di remediation di LSA.
+/// all'esecuzione del testo di remediation del tool esterno.
 pub struct SingleTaskOutcome {
     pub ok: bool,
     pub log: String,

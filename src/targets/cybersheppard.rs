@@ -383,11 +383,11 @@ async fn handle_server_message(
                 // lettura) e riporta i risultati come command_response con
                 // payload SecurityAuditResponse.
                 run_security_audit_command(config, out, target_id, &payload.params).await?;
-            } else if payload.action == "apply_lsa_check" {
+            } else if payload.action == "apply_remediation" {
                 // Applica UN task ad-hoc della DSL (mappa di remediation
-                // curata per un check LSA specifico) — mai il testo di
-                // remediation di LSA alla lettera.
-                run_apply_lsa_check_command(config, out, target_id, &payload.params).await?;
+                // curata per un check specifico) — mai il testo di
+                // remediation del tool esterno alla lettera.
+                run_apply_remediation_command(config, out, target_id, &payload.params).await?;
             } else {
                 // Altri comandi (ping/get_version): risposta generica.
                 let (success, output, error) = execute_command(&payload).await;
@@ -532,11 +532,11 @@ async fn run_security_audit_command(
 }
 
 /// Applica (bloccante → spawn_blocking) UN task ad-hoc della DSL — risoluzione
-/// server-side di un check LSA verso `lsa_check_remediation_map`, mai
+/// server-side di un check verso `security_audit_remediations`, mai
 /// esecuzione diretta del testo di remediation del tool. Risposta con chiave
-/// `lsa_apply_id`, distinta da `execution_id`/`security_audit_execution_id`
+/// `remediation_execution_id`, distinta da `execution_id`/`security_audit_execution_id`
 /// per il dispatch dual-shape lato server.
-async fn run_apply_lsa_check_command(
+async fn run_apply_remediation_command(
     config: &TargetConfig,
     out: &tokio::sync::mpsc::UnboundedSender<Message>,
     target_id: i32,
@@ -546,11 +546,11 @@ async fn run_apply_lsa_check_command(
     let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("apply").to_string();
     let task = params.get("task").cloned().unwrap_or_else(|| serde_json::json!({}));
 
-    info!("[{}] Apply LSA check {} — mode={}", config.name, apply_id, mode);
+    info!("[{}] Apply remediation {} — mode={}", config.name, apply_id, mode);
 
     let outcome = tokio::task::spawn_blocking(move || super::hardening::run_single_task(&task, &mode))
         .await
-        .map_err(|e| anyhow::anyhow!("join apply_lsa_check: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("join apply_remediation: {}", e))?;
 
     let status = if outcome.ok { "completed" } else { "failed" };
     let msg = serde_json::json!({
@@ -558,7 +558,7 @@ async fn run_apply_lsa_check_command(
         "target_id": target_id,
         "timestamp": chrono::Utc::now().timestamp(),
         "payload": {
-            "lsa_apply_id": apply_id,
+            "remediation_execution_id": apply_id,
             "status": status,
             "ok": outcome.ok,
             "log": outcome.log,
@@ -569,7 +569,7 @@ async fn run_apply_lsa_check_command(
     out.send(Message::Text(msg.to_string()))
         .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
 
-    info!("[{}] Apply LSA check {} → {}", config.name, apply_id, status);
+    info!("[{}] Apply remediation {} → {}", config.name, apply_id, status);
     Ok(())
 }
 
