@@ -1,6 +1,7 @@
 mod cybersheppard;
 mod firedog;
 pub(crate) mod hardening;
+mod security_audit;
 mod sentinelcore;
 
 use crate::config::{SystemType, TargetConfig};

@@ -378,6 +378,11 @@ async fn handle_server_message(
                 // Applica (o simula) un template di hardening e riporta lo stato
                 // come command_response con payload HardeningResponse.
                 run_hardening_command(config, out, target_id, &payload.params).await?;
+            } else if payload.action == "security_audit_scan" {
+                // Esegue il Linux-Security-Audit-Project vendorizzato (sola
+                // lettura) e riporta i risultati come command_response con
+                // payload SecurityAuditResponse.
+                run_security_audit_command(config, out, target_id, &payload.params).await?;
             } else {
                 // Altri comandi (ping/get_version): risposta generica.
                 let (success, output, error) = execute_command(&payload).await;
@@ -471,6 +476,53 @@ async fn run_hardening_command(
     });
     send_hardening_status(out, target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref())?;
     info!("[{}] Hardening exec {} → {}", config.name, exec_id, outcome.status);
+    Ok(())
+}
+
+/// Esegue il security-audit vendorizzato (bloccante → spawn_blocking) e
+/// riporta l'esito al server come `command_response` con payload
+/// SecurityAuditResponse (chiave `security_audit_execution_id`, distinta da
+/// `execution_id` di HardeningResponse così il server disambigua i due tipi
+/// di risposta allo stesso modo già usato per l'hardening).
+async fn run_security_audit_command(
+    config: &TargetConfig,
+    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    target_id: i32,
+    params: &serde_json::Value,
+) -> Result<()> {
+    let exec_id = params.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let modules = params
+        .get("modules")
+        .and_then(|v| v.as_str())
+        .unwrap_or("All")
+        .to_string();
+
+    info!("[{}] Security audit exec {} — moduli: {}", config.name, exec_id, modules);
+
+    let outcome = tokio::task::spawn_blocking(move || super::security_audit::run_security_audit(&modules))
+        .await
+        .map_err(|e| anyhow::anyhow!("join security_audit: {}", e))?;
+
+    let results_compressed = crate::compression::compress_json(&outcome.results, config.compression_level)
+        .ok()
+        .and_then(|c| serde_json::to_value(c).ok());
+
+    let msg = serde_json::json!({
+        "msg_type": "command_response",
+        "target_id": target_id,
+        "timestamp": chrono::Utc::now().timestamp(),
+        "payload": {
+            "security_audit_execution_id": exec_id,
+            "status": outcome.status,
+            "summary": outcome.summary,
+            "results_compressed": results_compressed,
+            "error": outcome.error,
+        }
+    });
+    out.send(Message::Text(msg.to_string()))
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+
+    info!("[{}] Security audit exec {} → {}", config.name, exec_id, outcome.status);
     Ok(())
 }
 

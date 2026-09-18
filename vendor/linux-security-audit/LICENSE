@@ -1,0 +1,429 @@
+MIT License
+
+Copyright (c) 2024-2026 Sandler73
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+===============================================================================
+                         ADDITIONAL TERMS AND NOTICES
+===============================================================================
+
+The following additional terms supplement but do not replace the MIT License
+above. In the event of a conflict, the MIT License text shall govern.
+
+-------------------------------------------------------------------------------
+1. DISCLAIMER OF WARRANTY
+-------------------------------------------------------------------------------
+
+THE SOFTWARE IS PROVIDED ON AN "AS IS" AND "AS AVAILABLE" BASIS. THE AUTHORS,
+COPYRIGHT HOLDERS, AND CONTRIBUTORS MAKE NO REPRESENTATIONS OR WARRANTIES OF
+ANY KIND, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING BUT NOT
+LIMITED TO:
+
+    (a) WARRANTIES OF MERCHANTABILITY -- No warranty that the Software is of
+        merchantable quality, fit for sale, or suitable for commercial use.
+
+    (b) FITNESS FOR A PARTICULAR PURPOSE -- No warranty that the Software will
+        meet your specific requirements, fulfill a particular need, or perform
+        in a manner you expect. This includes, without limitation, use in
+        production environments, regulated industries, critical infrastructure,
+        safety-critical systems, classified networks, or any environment where
+        software failure or inaccurate audit findings could result in harm to
+        persons, property, or organizational reputation.
+
+    (c) NON-INFRINGEMENT -- No warranty that the Software does not infringe
+        upon the intellectual property rights, patents, trademarks, trade
+        secrets, or copyrights of any third party.
+
+    (d) ACCURACY OR COMPLETENESS -- No warranty that the Software, its
+        documentation, audit findings, severity ratings, cross-framework
+        mappings, remediation guidance, compliance scoring, or behavior is
+        accurate, complete, reliable, current, or free of errors, defects,
+        false positives, false negatives, or harmful components. The Software
+        is not a substitute for qualified human security review, formal
+        compliance assessment, or accredited third-party audit.
+
+    (e) UNINTERRUPTED OR ERROR-FREE OPERATION -- No warranty that the Software
+        will operate without interruption, that defects will be corrected, or
+        that the Software is free of bugs, vulnerabilities, or security flaws.
+
+    (f) COMPATIBILITY -- No warranty that the Software is compatible with any
+        particular hardware architecture, Linux distribution, distribution
+        version, kernel version, kernel configuration, Python version, Python
+        interpreter, package manager, init system, mandatory access control
+        framework (SELinux, AppArmor, etc.), containerization platform, or
+        other component, or that it will remain compatible with future
+        versions of any dependency.
+
+    (g) SECURITY -- No warranty that the Software provides adequate security
+        protections, that its findings reflect actual security posture, that
+        its severity ratings reflect actual risk, that its cross-framework
+        mappings are exhaustive or correct for any particular regulatory
+        regime, or that the Software is free from exploitable vulnerabilities.
+        While the Software incorporates security best practices (including
+        read-only-by-default operation, dual-confirmation gating on
+        remediation, parameter validation, no external network calls, no
+        credential handling, and zero external dependencies), these measures
+        do not constitute a guarantee of security or compliance.
+
+    (h) DATA INTEGRITY -- No warranty that the Software will not cause loss,
+        corruption, or unauthorized modification of data, files, system
+        configurations, sysctl parameters, PAM configurations, SSH
+        configurations, firewall rules, cron jobs, systemd unit files,
+        file permissions, or audit policies.
+
+    (i) SYSTEM MODIFICATION -- The Software, when invoked with remediation
+        flags (--remediate or similar), is designed to make system-level
+        modifications to Linux operating systems, including but not limited
+        to: sysctl parameter changes, file permission changes, service
+        configuration changes, PAM module configuration, SSH daemon
+        configuration, firewall rule modifications, package installation
+        or removal, kernel parameter tuning, and audit policy changes.
+        Users acknowledge that such modifications carry inherent risks,
+        including but not limited to: failed boots, network connectivity
+        loss, authentication failures, service disruption, application
+        breakage, and data loss. Users accept full responsibility for any
+        consequences arising from the use of remediation features.
+
+    (j) COMPLIANCE OUTCOMES -- No warranty that use of the Software, or
+        remediation of findings reported by the Software, will result in any
+        particular compliance, audit, certification, attestation, or
+        regulatory outcome. Compliance frameworks evolve continuously; the
+        Software's interpretation of any framework is subject to change and
+        may differ from the interpretation of an accredited assessor or
+        regulatory body. Users requiring formal compliance attestation must
+        engage qualified human auditors.
+
+THE ENTIRE RISK AS TO THE QUALITY, PERFORMANCE, ACCURACY, SECURITY, AND
+RESULTS OBTAINED FROM THE SOFTWARE IS WITH YOU. SHOULD THE SOFTWARE PROVE
+DEFECTIVE, INACCURATE, OR INCOMPLETE, YOU ASSUME THE COST OF ALL NECESSARY
+SERVICING, REPAIR, OR CORRECTION.
+
+-------------------------------------------------------------------------------
+2. LIMITATION OF LIABILITY
+-------------------------------------------------------------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+AUTHORS, COPYRIGHT HOLDERS, CONTRIBUTORS, OR ANY PARTY WHO MODIFIES AND/OR
+REDISTRIBUTES THE SOFTWARE BE LIABLE FOR ANY OF THE FOLLOWING, WHETHER BASED
+ON WARRANTY, CONTRACT, TORT (INCLUDING NEGLIGENCE), STRICT LIABILITY, OR ANY
+OTHER LEGAL THEORY, EVEN IF SUCH PARTY HAS BEEN ADVISED OF THE POSSIBILITY
+OF SUCH DAMAGES:
+
+    (a) DIRECT DAMAGES -- Any direct financial loss, cost, or expense arising
+        from the use or inability to use the Software, or from acting upon
+        its findings.
+
+    (b) INDIRECT DAMAGES -- Any loss or damage that does not arise directly
+        from the Software but is a consequence of a direct loss.
+
+    (c) INCIDENTAL DAMAGES -- Any cost incurred as a result of a primary loss
+        caused by the Software, including but not limited to costs of
+        substitute goods, services, technology, or compensating controls.
+
+    (d) CONSEQUENTIAL DAMAGES -- Any loss resulting as a secondary consequence
+        of the use or failure of the Software, including but not limited to
+        loss of revenue, profit, business, goodwill, anticipated savings,
+        data, use, regulatory standing, certification status, or insurance
+        coverage.
+
+    (e) SPECIAL DAMAGES -- Any loss arising from special circumstances
+        particular to the user that were not foreseeable at the time the
+        Software was obtained.
+
+    (f) PUNITIVE OR EXEMPLARY DAMAGES -- Any damages imposed as punishment
+        or to set an example, regardless of the nature of the claim.
+
+    (g) LOSS OF DATA -- Any loss, corruption, destruction, or unauthorized
+        disclosure of data, regardless of whether such data was created,
+        stored, processed, transmitted, or managed by the Software.
+
+    (h) SYSTEM DAMAGE -- Any damage to computer systems, networks, hardware,
+        software, configurations, or infrastructure arising from the
+        installation, use, operation, or removal of the Software, including
+        but not limited to: kernel panics, boot failures, broken package
+        states, authentication lockouts, SSH access loss, firewall
+        misconfigurations, SELinux/AppArmor policy conflicts, service
+        failures, filesystem permission errors, or any data loss resulting
+        from remediation operations.
+
+    (i) AUDIT FINDINGS -- Any direct or indirect consequences of acting (or
+        failing to act) upon findings reported by the Software, including
+        but not limited to: false positives, false negatives, missed
+        vulnerabilities, misclassified severities, incorrect cross-framework
+        mappings, incomplete remediation guidance, unintended remediation
+        side effects, or any business or regulatory decision based on the
+        Software's output.
+
+    (j) THIRD-PARTY CLAIMS -- Any claims brought by third parties, including
+        auditors, regulators, customers, partners, or law-enforcement
+        agencies, against the user arising from the user's use of the
+        Software or reliance on its findings.
+
+IF ANY JURISDICTION DOES NOT ALLOW THE EXCLUSION OR LIMITATION OF LIABILITY
+FOR CERTAIN TYPES OF DAMAGES, THE LIABILITY OF THE AUTHORS AND CONTRIBUTORS
+SHALL BE LIMITED TO THE MAXIMUM EXTENT PERMITTED BY THE APPLICABLE LAW OF
+THAT JURISDICTION.
+
+IN NO EVENT SHALL THE TOTAL AGGREGATE LIABILITY OF THE AUTHORS, COPYRIGHT
+HOLDERS, AND CONTRIBUTORS FOR ALL CLAIMS ARISING OUT OF OR RELATED TO THE
+SOFTWARE EXCEED THE AMOUNT PAID BY YOU FOR THE SOFTWARE (WHICH IS ZERO, AS
+THE SOFTWARE IS PROVIDED FREE OF CHARGE).
+
+-------------------------------------------------------------------------------
+3. INDEMNIFICATION
+-------------------------------------------------------------------------------
+
+You agree to indemnify, defend, and hold harmless the authors, copyright
+holders, and contributors from and against any and all claims, demands,
+actions, liabilities, damages, losses, costs, and expenses (including
+reasonable attorneys' fees) arising out of or related to:
+
+    (a) Your use or misuse of the Software;
+
+    (b) Your violation of any applicable law, regulation, contract, or
+        third-party right in connection with your use of the Software;
+
+    (c) Any content, data, sysctl change, PAM configuration change,
+        firewall rule change, service configuration change, file permission
+        change, or system configuration change made by the Software under
+        your direction or control;
+
+    (d) Your modification, redistribution, or sublicensing of the Software;
+
+    (e) Any claim that your use of the Software, or your reliance on its
+        findings, caused damage to a third party;
+
+    (f) Any claim arising from a regulatory proceeding, audit, certification
+        review, or insurance claim involving the Software's output;
+
+    (g) Any claim arising from operational disruption caused by remediation
+        operations performed by the Software.
+
+-------------------------------------------------------------------------------
+4. USER RESPONSIBILITY
+-------------------------------------------------------------------------------
+
+You are solely responsible for:
+
+    (a) SUITABILITY -- Ensuring the suitability of this Software for your
+        intended use, system configuration, Linux distribution, regulatory
+        regime, and operational context.
+
+    (b) BACKUPS -- Creating adequate backups of your data, system state,
+        configuration files, sysctl settings, PAM configuration, SSH
+        configuration, firewall rules, and service configurations before
+        running this Software with any remediation flag enabled. The
+        Software does not create system snapshots automatically.
+
+    (c) AUDIT-ONLY REVIEW -- Reviewing the operations the Software would
+        perform by running it in audit-only mode (the default, with no
+        remediation flags) and inspecting the generated reports BEFORE
+        enabling any remediation flag.
+
+    (d) PILOT TESTING -- Testing this Software, including remediation
+        operations, in a non-production environment representative of your
+        production configuration before deploying to systems with important
+        data, services, or compliance obligations.
+
+    (e) INTEGRITY -- Maintaining the security of your systems, including
+        verifying the integrity and authenticity of the Software before
+        execution (e.g., via SHA-256 checksum verification or by reviewing
+        the source code).
+
+    (f) COMPLIANCE -- Complying with all applicable laws, regulations,
+        contractual obligations, and third-party license agreements related
+        to your use of the Software, including any organizational policy on
+        automated security tooling, change management, or remediation
+        automation.
+
+    (g) PRIVILEGED EXECUTION -- Understanding that the Software requires
+        root (superuser) privileges to perform many checks. Granting root
+        privileges to a script is a security-sensitive operation. You are
+        responsible for verifying the Software's integrity before each
+        privileged execution.
+
+    (h) HUMAN REVIEW -- Treating the Software's findings, severity ratings,
+        compliance scores, and remediation guidance as informational input
+        to a human-led decision process, NOT as authoritative compliance
+        attestation. The Software is a tool to support, not replace,
+        qualified human assessment.
+
+    (i) CHANGE MANAGEMENT -- Following your organization's change-management
+        processes when applying remediation findings to production systems.
+
+-------------------------------------------------------------------------------
+5. AUTHORIZED USE AND COMPLIANCE
+-------------------------------------------------------------------------------
+
+    (a) INTENDED PURPOSE -- This Software is intended for security
+        compliance auditing and configuration hardening of Linux operating
+        systems for personal, educational, professional, and authorized
+        organizational use only.
+
+    (b) AUTHORIZATION REQUIRED -- You must have explicit authorization to
+        run this Software on any system you do not personally own. Running
+        this Software on systems for which you lack authorization may
+        violate computer-misuse laws (such as the U.S. Computer Fraud and
+        Abuse Act, U.K. Computer Misuse Act 1990, EU NIS2 Directive, or
+        equivalent in your jurisdiction).
+
+    (c) LEGAL COMPLIANCE -- You are solely responsible for ensuring that
+        your use of the Software complies with all applicable local, state,
+        provincial, national, and international laws and regulations.
+
+    (d) PROHIBITED USE -- The authors and contributors do not authorize and
+        expressly disclaim any responsibility for the use of this Software:
+        - For any unlawful purpose;
+        - To audit, scan, or modify systems without authorization;
+        - To circumvent security controls of systems you do not own or
+          operate;
+        - To facilitate unauthorized access to information systems;
+        - To violate the rights of others.
+
+    (e) NO ENDORSEMENT -- Use of this Software does not imply endorsement,
+        sponsorship, accreditation, certification, or affiliation with:
+        - Defense Information Systems Agency (DISA)
+        - National Institute of Standards and Technology (NIST)
+        - Center for Internet Security, Inc. (CIS)
+        - National Security Agency (NSA)
+        - Cybersecurity and Infrastructure Security Agency (CISA)
+        - European Union Agency for Cybersecurity (ENISA)
+        - International Organization for Standardization (ISO)
+        - Any Linux distribution vendor (Canonical, Red Hat, SUSE, etc.)
+        - Any other organization, institution, or individual associated
+          with the cited compliance frameworks.
+
+    (f) FRAMEWORK CITATIONS -- This Software references and maps to publicly
+        published security frameworks for educational and audit-tooling
+        purposes. References to these frameworks are nominative use only
+        and do not constitute endorsement by, partnership with, or
+        certification from the publishing organizations.
+
+-------------------------------------------------------------------------------
+6. ZERO EXTERNAL DEPENDENCIES
+-------------------------------------------------------------------------------
+
+This Software is engineered to operate as a self-contained Python framework
+with ZERO external runtime dependencies. Specifically:
+
+    (a) NO PIP, CONDA, OR PACKAGE MANAGER DEPENDENCIES -- The Software does
+        not require, install, or download any package from PyPI, Conda,
+        or any other Python package repository.
+
+    (b) NO EXTERNAL NETWORK CALLS -- The Software performs no outbound
+        network requests during audit execution. All checks operate on
+        local-system state.
+
+    (c) PYTHON STANDARD LIBRARY ONLY -- The Software depends only on
+        built-in Python 3.7+ standard library modules (os, subprocess,
+        json, dataclasses, logging, etc.), built-in Linux commands
+        (sysctl, ss, systemctl, auditctl, etc.), direct /proc filesystem
+        reads, and standard configuration file parsing.
+
+    (d) NO BUNDLED BINARIES -- The Software contains no compiled binaries,
+        shared libraries, or native extensions. It is pure Python source
+        code.
+
+The "zero external dependencies" design property is a deliberate security
+and supply-chain integrity decision. It does not constitute a warranty
+that the Linux kernel, Python interpreter, GNU coreutils, or any other
+platform component is free of vulnerabilities.
+
+This License does not extend to Python, the Linux kernel, GNU coreutils,
+systemd, or any other platform component. Refer to those components'
+license terms separately.
+
+-------------------------------------------------------------------------------
+7. NO OBLIGATION OF SUPPORT
+-------------------------------------------------------------------------------
+
+The authors and contributors are under no obligation to provide technical
+support, maintenance, updates, patches, bug fixes, security advisories, or
+any other form of ongoing service or communication related to the Software.
+Any support provided is at the sole discretion of the authors and may be
+withdrawn at any time without notice.
+
+The authors and contributors make no commitment to:
+- Maintain compatibility with future Linux kernel releases, distribution
+  upgrades, or Python version changes
+- Update cross-framework mappings as compliance frameworks evolve
+- Add new compliance modules or expand check coverage
+- Fix reported issues within any particular timeframe
+- Respond to support requests, GitHub Issues, or pull requests
+- Provide commercial-grade support, SLAs, or guaranteed response times
+
+-------------------------------------------------------------------------------
+8. MODIFICATIONS AND CONTRIBUTIONS
+-------------------------------------------------------------------------------
+
+    (a) MODIFICATIONS -- You may modify the Software for your own use. If you
+        distribute modified versions, you must include prominent notice that
+        you have changed the Software, include the date of the changes, and
+        retain this License in its entirety.
+
+    (b) CONTRIBUTIONS -- By submitting contributions (including but not
+        limited to code, documentation, bug reports, feature requests,
+        compliance-framework mappings, and translations) to this project,
+        you grant the authors a perpetual, worldwide, non-exclusive,
+        royalty-free, irrevocable license to use, reproduce, modify,
+        display, perform, sublicense, and distribute your contributions as
+        part of the Software under the terms of this License.
+
+    (c) NO COMPENSATION -- You acknowledge that contributions are made
+        voluntarily and that no compensation, credit beyond standard
+        attribution, or other consideration is owed for contributions.
+
+    (d) ATTESTATION OF ORIGINALITY -- By contributing, you represent that
+        your contribution is your original work, or that you have all
+        necessary rights to license the contribution under the terms of
+        this License, and that your contribution does not infringe the
+        rights of any third party.
+
+-------------------------------------------------------------------------------
+9. TERMINATION
+-------------------------------------------------------------------------------
+
+This License is effective until terminated. Your rights under this License
+will terminate automatically without notice if you fail to comply with any
+of its terms. Upon termination, you shall cease all use and distribution of
+the Software and destroy all copies in your possession. Sections 1 through 7
+shall survive any termination of this License.
+
+-------------------------------------------------------------------------------
+10. GOVERNING LAW AND SEVERABILITY
+-------------------------------------------------------------------------------
+
+    (a) SEVERABILITY -- If any provision of this License is held to be
+        unenforceable or invalid, that provision shall be enforced to the
+        maximum extent permissible, and the remaining provisions shall
+        continue in full force and effect.
+
+    (b) ENTIRE AGREEMENT -- This License constitutes the entire agreement
+        between the parties with respect to the Software and supersedes all
+        prior or contemporaneous understandings, agreements, or
+        representations.
+
+    (c) WAIVER -- The failure of any party to enforce any provision of this
+        License shall not constitute a waiver of that party's right to
+        enforce that provision in the future.
+
+===============================================================================
+                               END OF LICENSE
+===============================================================================

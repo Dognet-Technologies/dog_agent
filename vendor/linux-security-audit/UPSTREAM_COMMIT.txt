@@ -1,0 +1,8 @@
+Vendorizzato da: https://github.com/Sandler73/Linux-Security-Audit-Project
+Commit upstream: 6bc8e9d1041b985bb494f106a73f78a7c1459192
+Data commit:     2026-07-25 11:44:48 -0400
+Vendorizzato il: 2026-09-18
+
+File inclusi: linux_security_audit.py, modules/, shared_components/, LICENSE.
+Non modificato rispetto all'upstream a questa data — vedi THIRD_PARTY_LICENSES.md
+alla radice del repo per la nota di attribuzione ed eventuali modifiche future.

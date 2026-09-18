@@ -494,7 +494,7 @@ static SHELL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// bloccare la raccolta dell'output. Allo scadere del timeout si uccide il
 /// process-group (best-effort) e comunque il processo diretto → l'agent prosegue.
 /// Ritorna (exit_code, output, timed_out).
-fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
+pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::sync::atomic::Ordering;
