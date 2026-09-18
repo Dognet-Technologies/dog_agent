@@ -137,6 +137,50 @@ pub fn run_hardening(
     }
 }
 
+/// Esito dell'applicazione di UN task ad-hoc (non un template intero) — usato
+/// dal motore di remediation curata: un check LSA con una entry in
+/// `lsa_check_remediation_map` viene risolto a un singolo task della stessa
+/// DSL usata dai template (stesse azioni, stesso `apply_task`), non
+/// all'esecuzione del testo di remediation di LSA.
+pub struct SingleTaskOutcome {
+    pub ok: bool,
+    pub log: String,
+    pub error: Option<String>,
+    pub rollback_data: Value,
+}
+
+/// Applica (o simula) un singolo task della DSL, fuori dal contesto di un
+/// template intero. Bloccante: va chiamata in `spawn_blocking`, come
+/// `run_hardening`.
+pub fn run_single_task(task: &Value, mode: &str) -> SingleTaskOutcome {
+    let dry = mode != "apply";
+    let mut file_backups: Vec<Value> = Vec::new();
+
+    let Some(action) = task.get("action").and_then(|v| v.as_str()) else {
+        return SingleTaskOutcome {
+            ok: false,
+            log: String::new(),
+            error: Some("task senza campo 'action'".to_string()),
+            rollback_data: json!({}),
+        };
+    };
+
+    match apply_task(action, task, dry, &mut file_backups) {
+        Ok(msg) => SingleTaskOutcome {
+            ok: true,
+            log: msg,
+            error: None,
+            rollback_data: json!({ "mode": mode, "files": file_backups }),
+        },
+        Err(e) => SingleTaskOutcome {
+            ok: false,
+            log: String::new(),
+            error: Some(e),
+            rollback_data: json!({ "mode": mode, "files": file_backups }),
+        },
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatch azioni
 // ─────────────────────────────────────────────────────────────────────────────

@@ -5,3 +5,5 @@ Cargo.lock
 .env
 /etc/
 .claude/
+__pycache__/
+*.pyc
