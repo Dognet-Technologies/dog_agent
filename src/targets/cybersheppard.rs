@@ -2,11 +2,11 @@
 ///
 /// Lifecycle:
 ///   connect → auth → [collect metrics → buffer → flush compresso ogni send_interval]
-///   Se la connessione cade: riconnessione con backoff esponenziale.
+///   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -15,25 +15,25 @@ use crate::collectors::{self, AllMetrics};
 use crate::compression::compress_json;
 use crate::config::TargetConfig;
 use crate::protocol::cybersheppard::*;
+use crate::reconnect::Reconnect;
 
 pub async fn run(config: TargetConfig) -> Result<()> {
-    let mut backoff = Duration::from_secs(config.reconnect.initial_backoff);
+    let mut reconnect = Reconnect::new(&config.reconnect);
 
     loop {
         info!("[{}] Connessione a {}", config.name, config.ws_url());
+        let started = Instant::now();
+        let result = session(&config).await;
+        let elapsed = started.elapsed();
 
-        match session(&config).await {
-            Ok(()) => {
-                info!("[{}] Sessione chiusa, riconnessione...", config.name);
-                backoff = Duration::from_secs(config.reconnect.initial_backoff);
-            }
-            Err(e) => {
-                error!("[{}] Errore sessione: {}", config.name, e);
-                warn!("[{}] Retry tra {:?}", config.name, backoff);
-                tokio::time::sleep(backoff).await;
-                backoff = next_backoff(backoff, &config);
-            }
+        match result {
+            Ok(()) => info!("[{}] Sessione chiusa, riconnessione...", config.name),
+            Err(e) => error!("[{}] Errore sessione: {}", config.name, e),
         }
+
+        let delay = reconnect.next_delay(elapsed);
+        warn!("[{}] Retry tra {:?}", config.name, delay);
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -512,9 +512,4 @@ async fn execute_command(cmd: &CommandPayload) -> (bool, Option<String>, Option<
             (false, None, Some(format!("Azione non supportata: {}", other)))
         }
     }
-}
-
-fn next_backoff(current: Duration, config: &TargetConfig) -> Duration {
-    let next_secs = (current.as_secs() as f64 * config.reconnect.backoff_multiplier) as u64;
-    Duration::from_secs(next_secs.min(config.reconnect.max_backoff))
 }

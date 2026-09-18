@@ -33,8 +33,11 @@ threat_threshold    = 75
 # Path monitorati per integrità file (FireDog check_integrity)
 integrity_paths = ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin"]
 
-# Reconnessione con exponential backoff
-reconnect = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }
+# Riconnessione a due livelli: veloce (fast_backoff_secs) per i primi
+# fast_max_attempts tentativi, poi lento (slow_backoff_secs) se il server resta
+# irraggiungibile. Una sessione stabile per almeno 15s fa ripartire dal livello
+# veloce al prossimo errore, anche se la disconnessione è brusca.
+reconnect = { fast_backoff_secs = 5, fast_max_attempts = 20, slow_backoff_secs = 1800 }
 
 # ─────────────────────────────────────────────────────────────
 # ESEMPIO: Target CyberSheppard
@@ -61,7 +64,7 @@ max_buffer_size     = 10
 # Collector abilitati
 collectors = { system = true, network = true, users = true, files = true, services = true, auditd = true, docker = true }
 
-reconnect = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }
+reconnect = { fast_backoff_secs = 5, fast_max_attempts = 20, slow_backoff_secs = 1800 }
 
 # ─────────────────────────────────────────────────────────────
 # ESEMPIO: Target SentinelCore (predisposto, non ancora attivo)
@@ -71,4 +74,4 @@ reconnect = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }
 # system_type = "sentinelcore"
 # url         = "wss://sentinelcore.yourdomain.com"
 # api_key     = "YOUR_SENTINELCORE_API_KEY_HERE"
-# reconnect   = { initial_backoff = 1, max_backoff = 300, backoff_multiplier = 2.0 }
+# reconnect   = { fast_backoff_secs = 5, fast_max_attempts = 20, slow_backoff_secs = 1800 }

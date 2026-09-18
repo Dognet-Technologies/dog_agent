@@ -241,20 +241,26 @@ impl Default for CollectorsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReconnectConfig {
-    #[serde(default = "default_initial_backoff")]
-    pub initial_backoff: u64,
-    #[serde(default = "default_max_backoff")]
-    pub max_backoff: u64,
-    #[serde(default = "default_backoff_multiplier")]
-    pub backoff_multiplier: f64,
+    /// Intervallo (secondi) tra i tentativi del livello veloce — usato subito
+    /// dopo un avvio o dopo una sessione stabile (vedi `reconnect.rs`).
+    #[serde(default = "default_fast_backoff_secs")]
+    pub fast_backoff_secs: u64,
+    /// Quanti tentativi al livello veloce prima di passare al livello lento.
+    #[serde(default = "default_fast_max_attempts")]
+    pub fast_max_attempts: u32,
+    /// Intervallo (secondi) tra i tentativi del livello lento, quando il
+    /// livello veloce si esaurisce senza riuscire a riconnettersi (server
+    /// presumibilmente giù per un periodo prolungato).
+    #[serde(default = "default_slow_backoff_secs")]
+    pub slow_backoff_secs: u64,
 }
 
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
-            initial_backoff: default_initial_backoff(),
-            max_backoff: default_max_backoff(),
-            backoff_multiplier: default_backoff_multiplier(),
+            fast_backoff_secs: default_fast_backoff_secs(),
+            fast_max_attempts: default_fast_max_attempts(),
+            slow_backoff_secs: default_slow_backoff_secs(),
         }
     }
 }
@@ -296,7 +302,7 @@ fn default_send_interval() -> u64 { 10 }
 fn default_compression_level() -> i32 { 3 }
 fn default_max_buffer_size() -> usize { 10 }
 fn default_threat_threshold() -> u32 { 75 }
-fn default_initial_backoff() -> u64 { 1 }
-fn default_max_backoff() -> u64 { 300 }
-fn default_backoff_multiplier() -> f64 { 2.0 }
+fn default_fast_backoff_secs() -> u64 { 5 }
+fn default_fast_max_attempts() -> u32 { 20 }
+fn default_slow_backoff_secs() -> u64 { 1800 }
 fn default_true() -> bool { true }

@@ -10,6 +10,7 @@ mod config;
 mod error;
 mod firewall;
 mod protocol;
+mod reconnect;
 mod targets;
 mod threat;
 
