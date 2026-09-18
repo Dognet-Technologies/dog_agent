@@ -2,11 +2,11 @@
 /// vedi THIRD_PARTY_LICENSES.md alla radice del repo) — usato in **sola
 /// lettura** (nessun flag di remediation) per popolare lo stato di compliance
 /// dei target con verifiche reali, invece della sola inferenza dal dry-run di
-/// hardening. Installato dal pacchetto in `/opt/dognet/linux-security-audit/`.
+/// hardening. Installato dal pacchetto in `/opt/sentinelsuite/cybersheppard/linux-security-audit/`.
 use serde_json::{json, Value};
 use std::path::Path;
 
-const AUDIT_SCRIPT: &str = "/opt/dognet/linux-security-audit/linux_security_audit.py";
+const AUDIT_SCRIPT: &str = "/opt/sentinelsuite/cybersheppard/linux-security-audit/linux_security_audit.py";
 /// Tetto di tempo per un audit completo: il tool dichiara 30-180s per un giro
 /// completo sequenziale di tutti i moduli; margine ampio per hardware lento.
 const AUDIT_TIMEOUT_SECS: u64 = 240;

@@ -12,7 +12,7 @@
 `dog-agent` include, invariato, il motore di audit di sicurezza Linux multi-framework
 (`linux_security_audit.py` + `modules/` + `shared_components/`) sotto
 `vendor/linux-security-audit/`, installato sul target in
-`/opt/dognet/linux-security-audit/`. È usato in sola lettura (modalità audit, senza flag
+`/opt/sentinelsuite/cybersheppard/linux-security-audit/`. È usato in sola lettura (modalità audit, senza flag
 `--remediate`) per popolare lo stato di compliance dei controlli (`security_audit_scan`).
 
 La licenza MIT consente esplicitamente uso commerciale, modifica, distribuzione e
