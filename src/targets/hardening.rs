@@ -557,9 +557,14 @@ fn act_script(task: &Value, dry: bool) -> Result<String, String> {
     let script = s(task, "script").ok_or("script mancante")?;
     if dry { return Ok(format!("eseguirebbe script ({} righe)", script.lines().count())); }
     let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
-    let (code, _out, timed_out) = run_shell(script, secs);
+    let (code, out, timed_out) = run_shell(script, secs);
     if timed_out { return Err(format!("timeout dopo {}s", secs)); }
-    if code != 0 { return Err(format!("script exit {}", code)); }
+    if code != 0 {
+        // L'output (stdout+stderr uniti) è indispensabile per capire PERCHÉ uno
+        // script è fallito (es. quale comando ha dato errore) - scartarlo qui
+        // lascia solo "script exit N" nei log, senza indizi utili.
+        return Err(format!("script exit {}: {}", code, out.trim()));
+    }
     Ok("script ok".into())
 }
 
@@ -589,7 +594,17 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
     let seq = SHELL_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = format!("/tmp/cs-hardening-{}-{}.out", std::process::id(), seq);
     // Redirect a file + stdin da /dev/null (niente prompt interattivi).
-    let full = format!("{{ {} ; }} </dev/null >{} 2>&1", cmd, tmp);
+    // `cmd` può arrivare con una o più righe vuote/newline finali (es. testo
+    // salvato con un newline di chiusura, comune per qualsiasi editor/tool):
+    // chiudendo con un `;` letterale subito dopo, bash vede una riga vuota
+    // seguita da un `;` senza alcun comando in mezzo -> "syntax error near
+    // unexpected token ';'" - il comando fallisce PRIMA di aprire la
+    // redirezione interna, quindi senza alcun output catturato (root cause
+    // di un fallimento "muto" trovato con azioni `script` multi-riga, es.
+    // NIST-AC-013/ISO27001-A.8.5-005 in CyberSheppard-Microsiem, 2026-09-20).
+    // `trim_end()` + newline (mai `;`) come separatore prima di `}` è
+    // robusto qualunque sia la formattazione finale di `cmd`.
+    let full = format!("{{ {}\n}} </dev/null >{} 2>&1", cmd.trim_end(), tmp);
 
     let spawn = Command::new("bash")
         .arg("-c")
@@ -628,7 +643,16 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
         }
     }
     let out = std::fs::read_to_string(&tmp).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp);
+    // Se il comando è fallito ma non abbiamo catturato nessun output, il file
+    // di supporto per il post-mortem vale più della pulizia immediata - un
+    // fallimento "muto" (es. errore di parsing della shell prima ancora che
+    // la redirezione interna prenda effetto) altrimenti non lascia alcuna
+    // traccia diagnosticabile.
+    if code != 0 && out.trim().is_empty() {
+        warn!(tmp = %tmp, code, cmd = %first_line(cmd), "run_shell: uscita non-zero senza output catturato, file mantenuto per diagnosi");
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
     (code, out, timed_out)
 }
 
@@ -802,5 +826,25 @@ mod tests {
         let msg = act_file_line_present(&task, true, &mut backups).unwrap();
         assert!(msg.contains("aggiornerebbe"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn script_con_newline_finale_non_rompe_il_wrapping() {
+        // Regressione: `run_shell` avvolgeva `cmd` in `{ cmd ; }` con un `;`
+        // letterale. Se `cmd` finisce con una riga vuota/newline (comune per
+        // testo salvato con newline di chiusura - è il caso reale di
+        // NIST-AC-013/ISO27001-A.8.5-005 in CyberSheppard-Microsiem, dove lo
+        // script è arrivato dal DB con un newline finale), bash vede un
+        // comando vuoto seguito da `;` -> "syntax error near unexpected
+        // token ';'" - lo script fallisce PRIMA di aprire la redirezione
+        // interna, quindi senza alcun output catturato (fallimento muto,
+        // 2026-09-20). Verifica che uno script con newline/righe vuote
+        // finali venga comunque esteguito correttamente.
+        let (_f, path) = tmp_file("");
+        let script = format!("echo ciao > {}\n\n", path);
+        let task = json!({ "script": script });
+        let msg = act_script(&task, false).unwrap();
+        assert_eq!(msg, "script ok");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "ciao");
     }
 }
