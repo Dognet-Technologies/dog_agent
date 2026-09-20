@@ -271,12 +271,37 @@ fn act_file_copy(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<St
 fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "file").ok_or("file mancante")?;
 
-    let mut wanted: Vec<String> = Vec::new();
+    // Ogni entry porta la propria riga + una posizione OPZIONALE
+    // (Some(true)="before", Some(false)="after") che sovrascrive quella
+    // condivisa del task per quella singola riga. Serve per stack ordinati
+    // (es. PAM) dove due righe vanno inserite ai due lati OPPOSTI dello
+    // stesso anchor nella stessa chiamata (una riga sola position/lines[]
+    // condivisi non lo esprime - causa reale di un'autenticazione rotta
+    // trovata testando NIST-AC-013/ISO27001-A.8.5-005, vedi migrazione
+    // 045 in CyberSheppard-Microsiem). `line`/`lines` restano invariati
+    // (nessuna posizione propria, usano sempre quella condivisa del task) -
+    // compatibilità totale con tutte le remediation già curate.
+    let mut wanted: Vec<(String, Option<bool>)> = Vec::new();
     if let Some(l) = s(task, "line") {
-        wanted.push(l.to_string());
+        wanted.push((l.to_string(), None));
     }
     if let Some(arr) = task.get("lines").and_then(|v| v.as_array()) {
-        wanted.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        wanted.extend(
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| (s.to_string(), None)),
+        );
+    }
+    if let Some(arr) = task.get("entries").and_then(|v| v.as_array()) {
+        for e in arr {
+            if let Some(line) = e.get("line").and_then(|v| v.as_str()) {
+                let pos = e
+                    .get("position")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p == "before");
+                wanted.push((line.to_string(), pos));
+            }
+        }
     }
     if wanted.is_empty() {
         return Err("line mancante".to_string());
@@ -287,7 +312,7 @@ fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
         .get("anchor")
         .and_then(|v| v.as_str())
         .and_then(|pat| regex::Regex::new(pat).ok());
-    let position_before = task.get("position").and_then(|v| v.as_str()) == Some("before");
+    let default_position_before = task.get("position").and_then(|v| v.as_str()) == Some("before");
     let comment = task.get("comment").and_then(|v| v.as_str());
 
     let existing = std::fs::read_to_string(file).unwrap_or_default();
@@ -296,7 +321,7 @@ fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
     let mut replaced = 0usize;
     let mut already = 0usize;
 
-    for want in &wanted {
+    for (want, per_entry_position) in &wanted {
         if out.iter().any(|l| l.trim() == want.trim()) {
             already += 1;
             continue;
@@ -321,6 +346,14 @@ fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
             }
         }
 
+        // L'anchor viene ri-cercato ad OGNI riga (non solo alla prima):
+        // se una riga precedente in questo stesso giro è già stata inserita
+        // prima dell'anchor, la posizione dell'anchor stesso si sposta in
+        // avanti - ricalcolarla ogni volta è quello che permette a due
+        // entry con position diversa (before/after) di finire nel punto
+        // giusto l'una rispetto all'altra, invece di finire entrambe dallo
+        // stesso lato.
+        let position_before = per_entry_position.unwrap_or(default_position_before);
         let mut insert_at = anchor_re
             .as_ref()
             .and_then(|re| out.iter().position(|l| re.is_match(l)))
@@ -670,6 +703,36 @@ mod tests {
             .to_string();
         std::fs::write(&path, content).unwrap();
         (TmpFile(path.clone()), path)
+    }
+
+    #[test]
+    fn entries_posiziona_ogni_riga_indipendentemente_rispetto_allo_stesso_anchor() {
+        // Regressione del bug reale trovato testando NIST-AC-013/ISO27001-A.8.5-005
+        // (pam_faillock): con `lines`+`position` condivisi, preauth E authfail
+        // finivano ENTRAMBE prima di pam_unix.so - authfail deve valutare
+        // l'esito del modulo precedente, quindi va dopo, non prima. `entries`
+        // dà a ciascuna riga la propria posizione rispetto allo stesso anchor.
+        let (_f, path) = tmp_file("auth [success=1 default=ignore] pam_unix.so nullok\n");
+        let task = json!({
+            "file": path,
+            "anchor": "auth.*pam_unix.so",
+            "entries": [
+                {"line": "auth required pam_faillock.so preauth silent audit deny=5", "position": "before"},
+                {"line": "auth [default=die] pam_faillock.so authfail audit deny=5", "position": "after"},
+            ],
+        });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg.contains("2 aggiunte"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "auth required pam_faillock.so preauth silent audit deny=5");
+        assert_eq!(lines[1], "auth [success=1 default=ignore] pam_unix.so nullok");
+        assert_eq!(lines[2], "auth [default=die] pam_faillock.so authfail audit deny=5");
+
+        // Idempotente: rieseguendo non aggiunge duplicati né altera l'ordine.
+        let msg2 = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg2.contains("2 riga/e già presenti"));
     }
 
     #[test]
