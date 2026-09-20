@@ -19,12 +19,13 @@ pub struct HardeningOutcome {
     pub total_controls: i32,
     pub successful_controls: i32,
     pub failed_controls: i32,
+    pub skipped_controls: i32,
     pub execution_log: String,
     pub rollback_data: Value,
     pub error: Option<String>,
-    /// Esito per-controllo `[{"control_id": "<slug YAML>", "ok": bool}]`, usato
-    /// dal server per aggiornare `target_control_status` via
-    /// `hardening_template_controls`.
+    /// Esito per-controllo `[{"control_id": "<slug YAML>", "status": "ok"|"failed"|"skipped"}]`,
+    /// usato dal server per aggiornare `target_control_status` via
+    /// `hardening_template_controls` (uno step "skipped" non tocca lo stato).
     pub control_results: Vec<Value>,
 }
 
@@ -41,9 +42,14 @@ pub struct ProgressUpdate {
 
 /// Punto d'ingresso: applica (o simula) il template. Funzione bloccante:
 /// va chiamata in `spawn_blocking`. `on_progress` è invocata dopo ogni controllo.
+/// `excluded` = `control_id` (slug YAML) da NON eseguire su questo target in
+/// questa esecuzione (Fase B, editor di esclusione per-target) — un check
+/// escluso resta "non conforme" (scelta esplicita dell'utente), distinto dal
+/// "mark not applicable" su `target_security_audit_status`.
 pub fn run_hardening(
     template: &Value,
     mode: &str,
+    excluded: &[String],
     mut on_progress: impl FnMut(ProgressUpdate),
 ) -> HardeningOutcome {
     let dry = mode != "apply";
@@ -59,12 +65,29 @@ pub fn run_hardening(
     let total = steps.len() as i32;
     let mut ok_controls = 0i32;
     let mut failed_controls = 0i32;
+    let mut skipped_controls = 0i32;
     let mut control_results: Vec<Value> = Vec::with_capacity(steps.len());
 
     for step in &steps {
         let cname = step.get("control_id").and_then(|v| v.as_str())
             .or_else(|| step.get("name").and_then(|v| v.as_str()))
             .unwrap_or("control");
+
+        if excluded.iter().any(|c| c == cname) {
+            logln!("\n--- Controllo: {} — [ESCLUSO] non eseguito per questo target ---", cname);
+            skipped_controls += 1;
+            control_results.push(json!({ "control_id": cname, "status": "skipped" }));
+            info!("Hardening: controllo '{}' escluso per questo target", cname);
+            on_progress(ProgressUpdate {
+                total,
+                successful: ok_controls,
+                failed: failed_controls,
+                current_control: cname.to_string(),
+                log: log.clone(),
+            });
+            continue;
+        }
+
         logln!("\n--- Controllo: {} ---", cname);
 
         let tasks = step.get("tasks").and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -105,7 +128,7 @@ pub fn run_hardening(
         }
 
         if control_ok { ok_controls += 1; } else { failed_controls += 1; }
-        control_results.push(json!({ "control_id": cname, "ok": control_ok }));
+        control_results.push(json!({ "control_id": cname, "status": if control_ok { "ok" } else { "failed" } }));
 
         // Notifica l'avanzamento (log parziale) dopo ogni controllo.
         info!("Hardening: controllo '{}' → {}/{} ok, {} falliti", cname, ok_controls, total, failed_controls);
@@ -122,14 +145,21 @@ pub fn run_hardening(
     // riportati in failed_controls (dettaglio parziale), non un errore d'esecuzione.
     // "failed" è riservato a un errore catastrofico che impedisce di procedere.
     let status = "completed";
-    logln!("\n=== Risultato: {}/{} controlli ok, {} falliti ===", ok_controls, total, failed_controls);
-    info!("Hardening {}: {}/{} ok, {} falliti", if dry {"dry-run"} else {"apply"}, ok_controls, total, failed_controls);
+    logln!(
+        "\n=== Risultato: {}/{} controlli ok, {} falliti, {} esclusi ===",
+        ok_controls, total, failed_controls, skipped_controls
+    );
+    info!(
+        "Hardening {}: {}/{} ok, {} falliti, {} esclusi",
+        if dry {"dry-run"} else {"apply"}, ok_controls, total, failed_controls, skipped_controls
+    );
 
     HardeningOutcome {
         status: status.to_string(),
         total_controls: total,
         successful_controls: ok_controls,
         failed_controls,
+        skipped_controls,
         execution_log: log,
         rollback_data: json!({ "mode": mode, "files": file_backups }),
         error: None,
@@ -846,5 +876,42 @@ mod tests {
         let msg = act_script(&task, false).unwrap();
         assert_eq!(msg, "script ok");
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "ciao");
+    }
+
+    #[test]
+    fn run_hardening_salta_i_controlli_esclusi_senza_eseguirne_i_task() {
+        // Fase B (editor di esclusione per-target): un control_id in `excluded`
+        // non deve eseguire NESSUNO dei suoi task (verificato: il file bersaglio
+        // resta vuoto), deve contare in `skipped_controls` (non in successful/
+        // failed) e il suo `control_results` deve avere status "skipped".
+        let (_excluded_f, excluded_path) = tmp_file("");
+        let (_kept_f, kept_path) = tmp_file("");
+        let template = json!({
+            "hardening_steps": [
+                {
+                    "control_id": "step-escluso",
+                    "tasks": [{ "action": "file_line_present", "file": excluded_path, "line": "non deve comparire" }]
+                },
+                {
+                    "control_id": "step-normale",
+                    "tasks": [{ "action": "file_line_present", "file": kept_path, "line": "riga attesa" }]
+                }
+            ]
+        });
+
+        let outcome = run_hardening(&template, "apply", &["step-escluso".to_string()], |_| {});
+
+        assert_eq!(outcome.total_controls, 2);
+        assert_eq!(outcome.successful_controls, 1);
+        assert_eq!(outcome.failed_controls, 0);
+        assert_eq!(outcome.skipped_controls, 1);
+        assert_eq!(std::fs::read_to_string(&excluded_path).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(&kept_path).unwrap().trim(), "riga attesa");
+
+        let results = outcome.control_results;
+        let escluso = results.iter().find(|r| r["control_id"] == "step-escluso").unwrap();
+        assert_eq!(escluso["status"], "skipped");
+        let normale = results.iter().find(|r| r["control_id"] == "step-normale").unwrap();
+        assert_eq!(normale["status"], "ok");
     }
 }

@@ -437,8 +437,18 @@ async fn run_hardening_command(
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0) as i32;
+    // Fase B: control_id (slug YAML) esclusi per questo target, risolti
+    // server-side da `target_hardening_exclusions` e allegati ai params.
+    let excluded: Vec<String> = params
+        .get("excluded_control_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
 
-    info!("[{}] Hardening exec {} ({}) — {} controlli", config.name, exec_id, mode, total);
+    info!(
+        "[{}] Hardening exec {} ({}) — {} controlli, {} esclusi",
+        config.name, exec_id, mode, total, excluded.len()
+    );
 
     // Stato iniziale "running".
     send_hardening_status(
@@ -452,7 +462,7 @@ async fn run_hardening_command(
     // subito al server come stato "running" → l'UI mostra cosa sta accadendo.
     let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<super::hardening::ProgressUpdate>();
     let handle = tokio::task::spawn_blocking(move || {
-        super::hardening::run_hardening(&template, &mode, move |u| {
+        super::hardening::run_hardening(&template, &mode, &excluded, move |u| {
             let _ = ptx.send(u);
         })
     });
@@ -475,6 +485,7 @@ async fn run_hardening_command(
         "total_controls": outcome.total_controls,
         "successful_controls": outcome.successful_controls,
         "failed_controls": outcome.failed_controls,
+        "skipped_controls": outcome.skipped_controls,
         "execution_log": outcome.execution_log,
         "rollback_data": outcome.rollback_data,
         "control_results": outcome.control_results,
