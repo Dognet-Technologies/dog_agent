@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServicesMetrics {
@@ -78,13 +79,44 @@ fn collect_systemd() -> Vec<ServiceStatus> {
     }
 }
 
+// Risultato di "docker è installato?" verificato una sola volta per tutta la
+// vita del processo agent (non ad ogni ciclo di collection) — su un host
+// senza Docker, lanciare comunque `docker ps` ogni 30s produceva un `execve`
+// fallito che auditd/Laurel registrava come evento di sicurezza a tutti gli
+// effetti: su un host reale senza Docker, migliaia di eventi di puro rumore
+// al giorno, per sempre (bug trovato analizzando il volume reale di
+// security_events sul lab: 18705 tentativi falliti accumulati in 17 giorni
+// su un solo host). Il controllo di presenza qui sotto è un check sul
+// filesystem (PATH), non uno spawn di processo: non genera a sua volta un
+// evento di audit come farebbe anche solo un `docker --version`.
+static DOCKER_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Vero se uno dei `dirs` contiene un file regolare chiamato `name` — stessa
+/// logica di una ricerca in PATH, isolata dall'ambiente reale per essere
+/// testabile senza mutare `PATH` del processo (condiviso tra i test).
+fn binary_exists_in<'a>(mut dirs: impl Iterator<Item = &'a std::path::Path>, name: &str) -> bool {
+    dirs.any(|dir| dir.join(name).is_file())
+}
+
+fn docker_binary_exists() -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let dirs: Vec<_> = std::env::split_paths(&path_var).collect();
+    binary_exists_in(dirs.iter().map(|p| p.as_path()), "docker")
+}
+
 fn collect_docker() -> Vec<ContainerStatus> {
+    if !*DOCKER_AVAILABLE.get_or_init(docker_binary_exists) {
+        return vec![];
+    }
+
     let output = match std::process::Command::new("docker")
         .args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}"])
         .output()
     {
         Ok(o) => o,
-        Err(_) => return vec![], // docker non installato o non raggiungibile
+        Err(_) => return vec![], // spawn fallito per un altro motivo (permessi, binario corrotto, ...)
     };
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -106,4 +138,60 @@ fn collect_docker() -> Vec<ContainerStatus> {
     }
 
     containers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Directory temporanea isolata (sotto il pid del test runner + un contatore
+    /// statico) invece di mutare `PATH`/usare una libreria esterna di tempdir —
+    /// evitabile qui perché il repo non ha ancora `tempfile` tra le dipendenze.
+    fn unique_tmp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dog-agent-test-{label}-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn binary_exists_in_trova_un_file_regolare_in_una_delle_directory() {
+        let dir = unique_tmp_dir("found");
+        fs::write(dir.join("docker"), b"").unwrap();
+        assert!(binary_exists_in(std::iter::once(dir.as_path()), "docker"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_exists_in_false_se_nessuna_directory_contiene_il_file() {
+        let dir = unique_tmp_dir("missing");
+        assert!(!binary_exists_in(std::iter::once(dir.as_path()), "docker"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_exists_in_ignora_una_directory_con_quel_nome_che_non_e_un_file() {
+        // Caso reale che ha causato il bug originale a monte: una PATH con molte
+        // directory dove "docker" non esiste in nessuna — qui si verifica che una
+        // sotto-directory chiamata "docker" (non un file) non dia un falso positivo.
+        let dir = unique_tmp_dir("subdir-not-file");
+        fs::create_dir_all(dir.join("docker")).unwrap();
+        assert!(!binary_exists_in(std::iter::once(dir.as_path()), "docker"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn docker_available_e_cache_una_sola_volta_per_lifetime_del_processo() {
+        // DOCKER_AVAILABLE è condiviso dal processo di test: qui si verifica solo
+        // che get_or_init non vada in panico e ritorni un bool coerente,
+        // chiamandolo più volte — il punto del fix (lo spawn di `docker` non
+        // avviene più ad ogni chiamata) non è osservabile da un test di unità
+        // senza mockare il filesystem di sistema, vedi collect_docker().
+        let first = *DOCKER_AVAILABLE.get_or_init(docker_binary_exists);
+        let second = *DOCKER_AVAILABLE.get_or_init(docker_binary_exists);
+        assert_eq!(first, second);
+    }
 }
