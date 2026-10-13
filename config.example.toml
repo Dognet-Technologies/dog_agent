@@ -14,6 +14,10 @@ log_level = "info"
 [[targets]]
 name          = "firedog-production"
 system_type   = "firedog"
+# wss:// consigliato (default HTTPS del master, v1.1.0+): accetta anche
+# certificati self-signed senza configurazione aggiuntiva (stessa fiducia
+# già accettata lato browser per lo stesso cert). ws:// resta supportato
+# per compatibilità con master installati senza HTTPS (--skip-tls).
 url           = "wss://firedog.yourdomain.com"
 api_key       = "YOUR_FIREDOG_API_KEY_HERE"
 
@@ -29,6 +33,23 @@ heartbeat_interval  = 30
 # Blocco automatico locale se score >= threat_threshold
 auto_block_threats  = true
 threat_threshold    = 75
+
+# Formula threat-score (introdotta in v1.1.0, prima hardcoded). Se ometti
+# questi campi, l'agent usa i default ricalibrati (vedi src/config.rs) — MENO
+# aggressivi delle costanti storiche pre-v1.1.0, che rendevano troppo facile
+# l'auto-block di un admin che sbaglia la password SSH qualche volta.
+#
+# Brute-force SSH: score = tentativi_falliti × bruteforce_score_per_attempt,
+# scatta da bruteforce_min_attempts tentativi in su.
+bruteforce_min_attempts       = 10
+bruteforce_score_per_attempt  = 7
+# SYN flood: score = connessioni_SYN_RECV × synflood_score_per_conn, scatta
+# da synflood_min_connections connessioni simultanee in su.
+synflood_min_connections      = 35
+synflood_score_per_conn       = 2
+# Questi 4 campi sono anche editabili da FireDog UI (push via WebSocket,
+# CommandAction::UpdateConfig) — il push riscrive queste righe e riavvia
+# dog-agent, non serve editarle a mano se lo si fa da UI.
 
 # Path monitorati per integrità file (FireDog check_integrity)
 integrity_paths = ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin"]

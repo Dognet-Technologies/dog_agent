@@ -13,6 +13,7 @@ mod protocol;
 mod reconnect;
 mod targets;
 mod threat;
+mod ws;
 
 use config::Config;
 use targets::spawn_target;
@@ -67,7 +68,8 @@ async fn main() -> Result<()> {
 
     // Avvia un task tokio per ogni target
     let mut handles = Vec::new();
-    for target in config.targets {
+    for mut target in config.targets {
+        target.config_path = args.config.clone();
         let name = target.name.clone();
         let handle = tokio::spawn(async move {
             spawn_target(target).await;

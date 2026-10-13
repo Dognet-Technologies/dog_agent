@@ -1,6 +1,6 @@
 [package]
 name = "dog-agent"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 authors = ["Dognet Technologies"]
 description = "Unified agent for Dognet Suite (FireDog, CyberSheppard, SentinelCore)"
@@ -14,6 +14,11 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# Verifier custom per accettare i certificati self-signed del master (LAN,
+# HTTPS di default) — stessa fiducia già accettata lato browser per lo stesso
+# certificato. Versione allineata a quella risolta transitivamente da
+# tokio-tungstenite (vedi Cargo.lock), non introduce un secondo rustls.
+rustls = { version = "0.22", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 
 # Serialization

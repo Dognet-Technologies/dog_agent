@@ -12,18 +12,31 @@ use tracing::{info, warn};
 
 use crate::protocol::firedog::{ThreatEntry, ThreatType};
 
+/// Parametri della formula di scoring, configurabili per-target via
+/// `agent.conf` (vedi `TargetConfig` in `src/config.rs`) invece che
+/// hardcoded. `auto_block_threshold`/`auto_block_enabled` decidono quando
+/// scatta il blocco iptables; gli altri 4 campi decidono QUANTO viene
+/// considerata grave una minaccia (soglia di innesco + punti per evento).
+#[derive(Debug, Clone, Copy)]
+pub struct ThreatScoringConfig {
+    pub auto_block_threshold: u32,
+    pub auto_block_enabled: bool,
+    pub bruteforce_min_attempts: u32,
+    pub bruteforce_score_per_attempt: u32,
+    pub synflood_min_connections: u32,
+    pub synflood_score_per_conn: u32,
+}
+
 pub struct ThreatDetector {
-    threshold: u32,
-    auto_block: bool,
+    config: ThreatScoringConfig,
     /// IP già bloccati (evita blocchi duplicati)
     blocked_ips: Vec<String>,
 }
 
 impl ThreatDetector {
-    pub fn new(threshold: u32, auto_block: bool) -> Self {
+    pub fn new(config: ThreatScoringConfig) -> Self {
         Self {
-            threshold,
-            auto_block,
+            config,
             blocked_ips: vec![],
         }
     }
@@ -39,9 +52,11 @@ impl ThreatDetector {
         }
 
         // Applica blocco automatico per minacce sopra threshold
-        if self.auto_block {
+        if self.config.auto_block_enabled {
             for threat in &mut threats {
-                if threat.score >= self.threshold && !self.blocked_ips.contains(&threat.src_ip) {
+                if threat.score >= self.config.auto_block_threshold
+                    && !self.blocked_ips.contains(&threat.src_ip)
+                {
                     if let Err(e) = self.block_ip(&threat.src_ip) {
                         warn!("Blocco automatico fallito per {}: {}", threat.src_ip, e);
                     } else {
@@ -61,14 +76,18 @@ impl ThreatDetector {
 
     #[cfg(target_os = "linux")]
     async fn scan_auth_log(&mut self) -> Vec<ThreatEntry> {
-        tokio::task::spawn_blocking(scan_auth_log_sync)
+        let min_attempts = self.config.bruteforce_min_attempts;
+        let score_per_attempt = self.config.bruteforce_score_per_attempt;
+        tokio::task::spawn_blocking(move || scan_auth_log_sync(min_attempts, score_per_attempt))
             .await
             .unwrap_or_default()
     }
 
     #[cfg(target_os = "linux")]
     async fn scan_port_connections(&mut self) -> Vec<ThreatEntry> {
-        tokio::task::spawn_blocking(scan_connections_sync)
+        let min_connections = self.config.synflood_min_connections;
+        let score_per_conn = self.config.synflood_score_per_conn;
+        tokio::task::spawn_blocking(move || scan_connections_sync(min_connections, score_per_conn))
             .await
             .unwrap_or_default()
     }
@@ -95,7 +114,7 @@ impl ThreatDetector {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-fn scan_auth_log_sync() -> Vec<ThreatEntry> {
+fn scan_auth_log_sync(min_attempts: u32, score_per_attempt: u32) -> Vec<ThreatEntry> {
     use std::collections::HashMap;
     let mut ip_failures: HashMap<String, (u32, String)> = HashMap::new();
     let mut threats = Vec::new();
@@ -125,9 +144,8 @@ fn scan_auth_log_sync() -> Vec<ThreatEntry> {
     }
 
     for (ip, (count, service)) in ip_failures {
-        if count >= 5 {
-            // 5+ tentativi falliti → brute force
-            let score = (count * 10).min(100) as u32;
+        if count >= min_attempts {
+            let score = (count * score_per_attempt).min(100);
             let classification = crate::protocol::firedog::classify_score(score);
 
             threats.push(ThreatEntry {
@@ -151,7 +169,7 @@ fn scan_auth_log_sync() -> Vec<ThreatEntry> {
 }
 
 #[cfg(target_os = "linux")]
-fn scan_connections_sync() -> Vec<ThreatEntry> {
+fn scan_connections_sync(min_connections: u32, score_per_conn: u32) -> Vec<ThreatEntry> {
     use std::collections::HashMap;
     // Legge /proc/net/tcp per rilevare IP con molte connessioni SYN_RECV
     // (indicativo di SYN flood)
@@ -179,8 +197,8 @@ fn scan_connections_sync() -> Vec<ThreatEntry> {
     }
 
     for (ip, count) in syn_count {
-        if count >= 20 {
-            let score = (count * 3).min(100) as u32;
+        if count >= min_connections {
+            let score = (count * score_per_conn).min(100);
             threats.push(ThreatEntry {
                 src_ip: ip.clone(),
                 dst_ip: None,

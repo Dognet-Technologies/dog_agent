@@ -5,6 +5,12 @@ via WebSocket a uno o più backend **FireDog**, **CyberSheppard** e
 **SentinelCore** (predisposto), configurati come `[[targets]]` indipendenti
 in `/etc/dog-agent/agent.conf`.
 
+## 🆕 Novità in v1.2.0
+
+- **Connessione `wss://`** — accetta anche certificati self-signed del master (stessa fiducia già richiesta al browser per lo stesso certificato, vedi `src/ws.rs`), senza pinning. `ws://` in chiaro resta supportato per compatibilità.
+- **Formula threat-score (FireDog) configurabile** — soglie di innesco brute-force/SYN-flood e punti per evento non più hardcoded (`src/threat/mod.rs`), nuovi campi in `TargetConfig`/`agent.conf`. Default ricalibrati meno aggressivi rispetto alle costanti storiche.
+- **`CommandAction::UpdateConfig` implementato** — il master può pushare una nuova config threat-scoring: l'agent riscrive le righe cambiate in `agent.conf` (preservando commenti/formattazione) e schedula un riavvio del servizio fuori dal proprio cgroup (`systemd-run`), così l'ack di successo raggiunge il server prima del riavvio.
+
 ---
 
 ## Dipendenze di compilazione
@@ -18,8 +24,9 @@ in `/etc/dog-agent/agent.conf`.
 | target musl | `rustup target add x86_64-unknown-linux-musl` | build statica musl |
 | `cross` + Docker | `cargo install cross` | cross-compile arm64 / Windows |
 
-Non servono librerie di sistema (OpenSSL ecc.): il TLS è **rustls** con root
-CA webpki incluse, quindi il binario non ha dipendenze runtime.
+Non servono librerie di sistema (OpenSSL ecc.): il TLS è **rustls**, quindi
+il binario non ha dipendenze runtime. Per `wss://` accetta anche certificati
+self-signed (vedi `src/ws.rs`) invece delle sole root CA webpki.
 
 ## Compilazione
 

@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+fn default_config_path() -> PathBuf {
+    PathBuf::new()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Configurazione globale
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +99,22 @@ pub struct TargetConfig {
     #[serde(default = "default_threat_threshold")]
     pub threat_threshold: u32,
 
+    /// Formula threat-score, configurabile (vedi src/threat/mod.rs). Default
+    /// pari alle costanti storiche pre-v1.1.0, TRANNE dove indicato: gli
+    /// utenti che aggiornano l'agent senza toccare agent.conf ereditano il
+    /// comportamento ricalibrato, non quello originale — i default originali
+    /// (5 tentativi/×10, 20 connessioni/×3) erano troppo aggressivi: un
+    /// admin che sbaglia la password SSH ~8 volte finiva già in auto-block
+    /// con threat_threshold=75.
+    #[serde(default = "default_bruteforce_min_attempts")]
+    pub bruteforce_min_attempts: u32,
+    #[serde(default = "default_bruteforce_score_per_attempt")]
+    pub bruteforce_score_per_attempt: u32,
+    #[serde(default = "default_synflood_min_connections")]
+    pub synflood_min_connections: u32,
+    #[serde(default = "default_synflood_score_per_conn")]
+    pub synflood_score_per_conn: u32,
+
     /// Path monitorati per integrità file
     #[serde(default)]
     pub integrity_paths: Vec<String>,
@@ -135,10 +155,25 @@ pub struct TargetConfig {
     /// Impostazioni di reconnessione con backoff esponenziale
     #[serde(default)]
     pub reconnect: ReconnectConfig,
+
+    /// Path del file agent.conf da cui questo target è stato caricato — NON
+    /// letto dal TOML (`skip`), popolato da main.rs dopo `Config::load()`.
+    /// Serve a `CommandAction::UpdateConfig` (src/targets/firedog.rs) per
+    /// sapere quale file riscrivere quando il server pusha una nuova
+    /// configurazione threat-scoring.
+    #[serde(skip, default = "default_config_path")]
+    pub config_path: PathBuf,
 }
 
 impl TargetConfig {
     /// Restituisce l'URL WebSocket completo per il sistema configurato
+    /// `url` in agent.conf può essere `ws://`, `wss://`, `http://` o
+    /// `https://` — questi ultimi due normalizzati sullo scheme WS
+    /// equivalente. Per `wss://`, la connessione (vedi `crate::ws::connect`)
+    /// accetta certificati self-signed senza pinning: stessa fiducia già
+    /// accettata lato browser per lo stesso certificato del master, non
+    /// protegge da un MITM attivo. Aggiornare qui SE in futuro si aggiunge
+    /// pinning (fingerprint del cert salvato al pairing).
     pub fn ws_url(&self) -> String {
         let base = self
             .url
@@ -302,6 +337,13 @@ fn default_send_interval() -> u64 { 10 }
 fn default_compression_level() -> i32 { 3 }
 fn default_max_buffer_size() -> usize { 10 }
 fn default_threat_threshold() -> u32 { 75 }
+// Ricalibrati in v1.1.0 (meno aggressivi dei valori storici 5/×10, 20/×3 —
+// vedi commento su TargetConfig): 10 tentativi = score 70 (non ancora
+// auto-block), 15 = 100. 35 connessioni SYN_RECV = 70, 50 = 100.
+fn default_bruteforce_min_attempts() -> u32 { 10 }
+fn default_bruteforce_score_per_attempt() -> u32 { 7 }
+fn default_synflood_min_connections() -> u32 { 35 }
+fn default_synflood_score_per_conn() -> u32 { 2 }
 fn default_fast_backoff_secs() -> u64 { 5 }
 fn default_fast_max_attempts() -> u32 { 20 }
 fn default_slow_backoff_secs() -> u64 { 1800 }

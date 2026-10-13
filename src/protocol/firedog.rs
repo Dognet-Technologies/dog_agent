@@ -186,6 +186,13 @@ pub enum CommandAction {
     BlockIp,
     UnblockIp,
     UpdateConfig,
+    /// Impostazioni pcap (path salvataggio, tool tcpdump/tshark, filtri
+    /// custom) — SystemSettings globali lato Django, pushate a tutti i
+    /// target connessi quando l'admin le salva (vedi
+    /// backend/settings/views.py). Scrive /etc/firewall/firedog.conf, letto
+    /// da firewall-manager.py/traffic-analyzer.py ad ogni invocazione
+    /// (nessun demone da riavviare, a differenza di UpdateConfig).
+    UpdatePcapConfig,
     CheckIntegrity,
     #[serde(other)]
     Unknown,

@@ -8,7 +8,7 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::collectors::{self, AllMetrics};
@@ -38,7 +38,7 @@ pub async fn run(config: TargetConfig) -> Result<()> {
 }
 
 async fn session(config: &TargetConfig) -> Result<()> {
-    let (ws, _) = connect_async(config.ws_url()).await?;
+    let ws = crate::ws::connect(&config.ws_url()).await?;
     let (mut ws_tx, mut rx) = ws.split();
 
     let target_id = config.target_id.unwrap_or(0);
