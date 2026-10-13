@@ -7,3 +7,4 @@ Cargo.lock
 .claude/
 __pycache__/
 *.pyc
+.local-builds/
