@@ -59,6 +59,41 @@ impl std::fmt::Display for SystemType {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Ambiente del target (produzione / clone di test)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Ruolo di questo target nel ciclo di vita del deployment. Puramente
+/// informativo: non altera alcun comportamento dell'agent, nessun campo
+/// viene inviato ai backend. Serve a chi configura `linked_environments` su
+/// un device SentinelCore (vedi
+/// vulnerability-manager/migrations/159_device_linked_environments.sql) a
+/// sapere a colpo d'occhio, leggendo agent.conf del target, se questa
+/// istanza è il clone di testing/preproduzione o l'originale di produzione.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentEnvironment {
+    Production,
+    Testing,
+    Preproduction,
+}
+
+impl Default for AgentEnvironment {
+    fn default() -> Self {
+        AgentEnvironment::Production
+    }
+}
+
+impl std::fmt::Display for AgentEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentEnvironment::Production => write!(f, "production"),
+            AgentEnvironment::Testing => write!(f, "testing"),
+            AgentEnvironment::Preproduction => write!(f, "preproduction"),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Configurazione per ogni target
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -151,6 +186,11 @@ pub struct TargetConfig {
     pub laurel_log_path: Option<String>,
 
     // ── Condiviso ─────────────────────────────────────────────────────────────
+
+    /// Ruolo di questo target (production/testing/preproduction) — vedi
+    /// `AgentEnvironment`. Default: production.
+    #[serde(default)]
+    pub environment: AgentEnvironment,
 
     /// Impostazioni di reconnessione con backoff esponenziale
     #[serde(default)]

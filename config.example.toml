@@ -27,6 +27,14 @@ ip            = "192.168.1.100"
 hostname      = "web-server-01"
 mac           = "AA:BB:CC:DD:EE:FF"
 
+# Ruolo di questo target: production | testing | preproduction (default:
+# production se omesso). Puramente informativo — non viene inviato al
+# server, non cambia alcun comportamento dell'agent. Serve a chi legge
+# questo file a colpo d'occhio, ad es. quando compila il campo
+# linked_environments.<ambiente>.agent_id su un device SentinelCore per
+# dire quale agent_id corrisponde al clone di test/preproduzione.
+environment   = "production"
+
 # Intervallo heartbeat in secondi (default: 30)
 heartbeat_interval  = 30
 
@@ -71,6 +79,10 @@ api_key           = "YOUR_CYBERSHEPPARD_TOKEN_HERE"
 
 # ID assegnato dal backend CyberSheppard a questo target
 target_id         = 1
+
+# Ruolo di questo target: production | testing | preproduction (default:
+# production se omesso). Vedi commento nell'esempio FireDog sopra.
+environment       = "production"
 
 # Intervalli raccolta/invio metriche in secondi
 collection_interval = 30

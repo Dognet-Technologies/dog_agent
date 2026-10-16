@@ -71,6 +71,10 @@ async fn main() -> Result<()> {
     for mut target in config.targets {
         target.config_path = args.config.clone();
         let name = target.name.clone();
+        info!(
+            "[{}] ambiente configurato: {}",
+            name, target.environment
+        );
         let handle = tokio::spawn(async move {
             spawn_target(target).await;
         });
