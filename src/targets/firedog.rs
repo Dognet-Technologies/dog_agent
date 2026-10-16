@@ -497,9 +497,20 @@ struct PcapConfigUpdatePayload {
     pcap_save_path: Option<String>,
     pcap_analysis_tool: Option<String>,
     pcap_custom_filters: Option<Vec<String>>,
+    pcap_threat_commands: Option<Vec<String>>,
 }
 
 const MAX_PCAP_FILTERS: usize = 5;
+
+/// Chiavi dei comandi tcpdump curati per il pannello Dettagli minaccia (vedi
+/// get_pcap_threat_detail in firewall-manager.py) — a differenza di
+/// pcap_custom_filters, qui l'utente sceglie da un multi-select in Settings,
+/// mai testo libero: niente filtro BPF arbitrario arriva su questo canale,
+/// solo una di queste chiavi fisse. Validate comunque qui (whitelist) prima
+/// di scrivere il file — difesa in profondità, stesso principio già
+/// applicato a pcap_custom_filters.
+const VALID_THREAT_COMMAND_KEYS: [&str; 5] =
+    ["summary", "tcp_flags", "timing", "hex_dump", "icmp"];
 
 /// Scrive le chiavi PCAP_* cambiate in `/etc/firewall/firedog.conf`. A
 /// differenza di `update_threat_config`/agent.conf, qui non serve alcun
@@ -521,6 +532,13 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
             reject_unsafe_conf_value("pcap_custom_filters", f)?;
         }
     }
+    if let Some(ref commands) = p.pcap_threat_commands {
+        for c in commands {
+            if !VALID_THREAT_COMMAND_KEYS.contains(&c.as_str()) {
+                anyhow::bail!("pcap_threat_commands: chiave sconosciuta '{}'", c);
+            }
+        }
+    }
 
     let path = std::path::Path::new(FIREDOG_CONF_PATH);
     let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -539,6 +557,13 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
         remove_conf_lines_with_prefix(&mut lines, "PCAP_FILTER_");
         for (i, filter) in filters.iter().take(MAX_PCAP_FILTERS).enumerate() {
             lines.push(format!("PCAP_FILTER_{}={}", i + 1, bash_single_quote(filter)));
+        }
+        changed += 1;
+    }
+    if let Some(ref commands) = p.pcap_threat_commands {
+        remove_conf_lines_with_prefix(&mut lines, "PCAP_THREAT_CMD_");
+        for (i, key) in commands.iter().take(VALID_THREAT_COMMAND_KEYS.len()).enumerate() {
+            lines.push(format!("PCAP_THREAT_CMD_{}={}", i + 1, bash_single_quote(key)));
         }
         changed += 1;
     }
