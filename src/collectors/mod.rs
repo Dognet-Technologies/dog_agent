@@ -17,7 +17,7 @@ pub use services::ServicesMetrics;
 pub use system::SystemMetrics;
 pub use users::UsersMetrics;
 
-/// Snapshot completo di tutte le metriche (CyberSheppard)
+/// Snapshot completo di tutte le metriche (CyberShepherd)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllMetrics {
     pub collected_at: i64,

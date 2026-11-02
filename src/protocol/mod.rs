@@ -1,2 +1,2 @@
-pub mod cybersheppard;
+pub mod cybershepherd;
 pub mod firedog;

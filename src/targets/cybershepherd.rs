@@ -1,4 +1,4 @@
-/// Implementazione protocollo CyberSheppard.
+/// Implementazione protocollo CyberShepherd.
 ///
 /// Lifecycle:
 ///   connect → auth → [collect metrics → buffer → flush compresso ogni send_interval]
@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::collectors::{self, AllMetrics};
 use crate::compression::compress_json;
 use crate::config::TargetConfig;
-use crate::protocol::cybersheppard::*;
+use crate::protocol::cybershepherd::*;
 use crate::reconnect::Reconnect;
 
 pub async fn run(config: TargetConfig) -> Result<()> {
@@ -618,7 +618,7 @@ async fn execute_command(cmd: &CommandPayload) -> (bool, Option<String>, Option<
             None,
         ),
         other => {
-            warn!("Comando CyberSheppard non supportato: {}", other);
+            warn!("Comando CyberShepherd non supportato: {}", other);
             (false, None, Some(format!("Azione non supportata: {}", other)))
         }
     }

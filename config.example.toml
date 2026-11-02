@@ -69,15 +69,15 @@ integrity_paths = ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin"]
 reconnect = { fast_backoff_secs = 5, fast_max_attempts = 20, slow_backoff_secs = 1800 }
 
 # ─────────────────────────────────────────────────────────────
-# ESEMPIO: Target CyberSheppard
+# ESEMPIO: Target CyberShepherd
 # ─────────────────────────────────────────────────────────────
 [[targets]]
-name              = "cybersheppard-main"
-system_type       = "cybersheppard"
-url               = "wss://cybersheppard.yourdomain.com"
-api_key           = "YOUR_CYBERSHEPPARD_TOKEN_HERE"
+name              = "cybershepherd-main"
+system_type       = "cybershepherd"
+url               = "wss://cybershepherd.yourdomain.com"
+api_key           = "YOUR_CYBERSHEPHERD_TOKEN_HERE"
 
-# ID assegnato dal backend CyberSheppard a questo target
+# ID assegnato dal backend CyberShepherd a questo target
 target_id         = 1
 
 # Ruolo di questo target: production | testing | preproduction (default:

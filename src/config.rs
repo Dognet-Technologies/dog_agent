@@ -44,7 +44,9 @@ fn default_log_level() -> String {
 #[serde(rename_all = "lowercase")]
 pub enum SystemType {
     Firedog,
-    Cybersheppard,
+    // Il vecchio nome resta valido: gli agent.conf gia' installati lo usano.
+    #[serde(alias = "cybersheppard")]
+    Cybershepherd,
     Sentinelcore,
 }
 
@@ -52,7 +54,7 @@ impl std::fmt::Display for SystemType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SystemType::Firedog => write!(f, "firedog"),
-            SystemType::Cybersheppard => write!(f, "cybersheppard"),
+            SystemType::Cybershepherd => write!(f, "cybershepherd"),
             SystemType::Sentinelcore => write!(f, "sentinelcore"),
         }
     }
@@ -154,9 +156,9 @@ pub struct TargetConfig {
     #[serde(default)]
     pub integrity_paths: Vec<String>,
 
-    // ── CyberSheppard ─────────────────────────────────────────────────────────
+    // ── CyberShepherd ─────────────────────────────────────────────────────────
 
-    /// ID target assegnato dal backend CyberSheppard
+    /// ID target assegnato dal backend CyberShepherd
     pub target_id: Option<i32>,
 
     /// Intervallo raccolta metriche in secondi (default: 30)
@@ -175,7 +177,7 @@ pub struct TargetConfig {
     #[serde(default = "default_max_buffer_size")]
     pub max_buffer_size: usize,
 
-    /// Collector abilitati per CyberSheppard
+    /// Collector abilitati per CyberShepherd
     #[serde(default)]
     pub collectors: CollectorsConfig,
 
@@ -223,7 +225,7 @@ impl TargetConfig {
 
         match self.system_type {
             SystemType::Firedog => format!("{}/ws/agent/", base),
-            SystemType::Cybersheppard => format!("{}/api/agents/ws", base),
+            SystemType::Cybershepherd => format!("{}/api/agents/ws", base),
             SystemType::Sentinelcore => format!("{}/ws/agent/", base),
         }
     }
@@ -251,16 +253,16 @@ impl TargetConfig {
                     anyhow::bail!("Target '{}' (firedog): mac è obbligatorio", self.name);
                 }
             }
-            SystemType::Cybersheppard => {
+            SystemType::Cybershepherd => {
                 if self.target_id.is_none() {
                     anyhow::bail!(
-                        "Target '{}' (cybersheppard): target_id è obbligatorio",
+                        "Target '{}' (cybershepherd): target_id è obbligatorio",
                         self.name
                     );
                 }
                 if self.compression_level < 1 || self.compression_level > 22 {
                     anyhow::bail!(
-                        "Target '{}' (cybersheppard): compression_level deve essere 1-22",
+                        "Target '{}' (cybershepherd): compression_level deve essere 1-22",
                         self.name
                     );
                 }
@@ -275,7 +277,7 @@ impl TargetConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Collector config (CyberSheppard)
+// Collector config (CyberShepherd)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -388,3 +390,25 @@ fn default_fast_backoff_secs() -> u64 { 5 }
 fn default_fast_max_attempts() -> u32 { 20 }
 fn default_slow_backoff_secs() -> u64 { 1800 }
 fn default_true() -> bool { true }
+
+#[cfg(test)]
+mod system_type_tests {
+    use super::SystemType;
+
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        system_type: SystemType,
+    }
+
+    fn parse(value: &str) -> SystemType {
+        toml::from_str::<Wrapper>(&format!("system_type = \"{value}\""))
+            .expect("system_type valido")
+            .system_type
+    }
+
+    #[test]
+    fn accepts_new_and_legacy_cybershepherd_names() {
+        assert_eq!(parse("cybershepherd"), SystemType::Cybershepherd);
+        assert_eq!(parse("cybersheppard"), SystemType::Cybershepherd);
+    }
+}

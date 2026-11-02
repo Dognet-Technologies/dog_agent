@@ -1,7 +1,7 @@
 # Dog Agent
 
 Agent unificato della Dognet Suite: un singolo binario Rust che si connette
-via WebSocket a uno o più backend **FireDog**, **CyberSheppard** e
+via WebSocket a uno o più backend **FireDog**, **CyberShepherd** e
 **SentinelCore** (predisposto), configurati come `[[targets]]` indipendenti
 in `/etc/dog-agent/agent.conf`.
 
@@ -161,4 +161,4 @@ sudo dpkg -P dog-agent        # purge completo
 Vedi `config.example.toml`: ogni `[[targets]]` gira in un task tokio
 indipendente con riconnessione a backoff esponenziale. Campi obbligatori per
 FireDog: `ip`, `hostname`, `mac` (il server verifica
-`SHA512(ip+hostname+mac)` nel pairing); per CyberSheppard: `target_id`.
+`SHA512(ip+hostname+mac)` nel pairing); per CyberShepherd: `target_id`.

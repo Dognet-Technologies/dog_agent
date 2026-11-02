@@ -21,7 +21,7 @@ use targets::spawn_target;
 #[derive(Parser, Debug)]
 #[command(
     name = "dog-agent",
-    about = "Dognet Unified Agent — FireDog | CyberSheppard | SentinelCore",
+    about = "Dognet Unified Agent — FireDog | CyberShepherd | SentinelCore",
     version
 )]
 struct Args {

@@ -1,4 +1,4 @@
-/// Wrapper Zstd per la compressione dei payload CyberSheppard.
+/// Wrapper Zstd per la compressione dei payload CyberShepherd.
 
 use anyhow::Result;
 use serde::Serialize;

@@ -3,7 +3,7 @@ name = "dog-agent"
 version = "1.2.0"
 edition = "2021"
 authors = ["Dognet Technologies"]
-description = "Unified agent for Dognet Suite (FireDog, CyberSheppard, SentinelCore)"
+description = "Unified agent for Dognet Suite (FireDog, CyberShepherd, SentinelCore)"
 license = "MIT"
 
 [[bin]]
@@ -27,7 +27,7 @@ serde_json = "1.0"
 toml = "0.8"
 regex = "1"
 
-# Compression (CyberSheppard)
+# Compression (CyberShepherd)
 zstd = "0.13"
 
 # Hashing (file integrity)
@@ -72,7 +72,7 @@ maintainer = "Dognet Technologies <info@dognet.it>"
 copyright = "2024, Dognet Technologies"
 extended-description = """\
 Unified Dog Agent for the Dognet Suite.
-Supports FireDog, CyberSheppard and SentinelCore backends.
+Supports FireDog, CyberShepherd and SentinelCore backends.
 A single binary configured via /etc/dog-agent/agent.conf."""
 depends = "$auto"
 section = "net"
@@ -88,11 +88,11 @@ assets = [
     # Linux-Security-Audit-Project vendorizzato (MIT, vedi THIRD_PARTY_LICENSES.md) —
     # motore di scan usato dal comando agent `security_audit_scan`. Directory piatte
     # (nessuna sottodirectory), un glob a livello singolo per ciascuna basta.
-    ["vendor/linux-security-audit/linux_security_audit.py", "opt/sentinelsuite/cybersheppard/linux-security-audit/", "644"],
-    ["vendor/linux-security-audit/LICENSE", "opt/sentinelsuite/cybersheppard/linux-security-audit/", "644"],
-    ["vendor/linux-security-audit/UPSTREAM_COMMIT.txt", "opt/sentinelsuite/cybersheppard/linux-security-audit/", "644"],
-    ["vendor/linux-security-audit/modules/*.py", "opt/sentinelsuite/cybersheppard/linux-security-audit/modules/", "644"],
-    ["vendor/linux-security-audit/shared_components/*.py", "opt/sentinelsuite/cybersheppard/linux-security-audit/shared_components/", "644"],
+    ["vendor/linux-security-audit/linux_security_audit.py", "opt/sentinelsuite/cybershepherd/linux-security-audit/", "644"],
+    ["vendor/linux-security-audit/LICENSE", "opt/sentinelsuite/cybershepherd/linux-security-audit/", "644"],
+    ["vendor/linux-security-audit/UPSTREAM_COMMIT.txt", "opt/sentinelsuite/cybershepherd/linux-security-audit/", "644"],
+    ["vendor/linux-security-audit/modules/*.py", "opt/sentinelsuite/cybershepherd/linux-security-audit/modules/", "644"],
+    ["vendor/linux-security-audit/shared_components/*.py", "opt/sentinelsuite/cybershepherd/linux-security-audit/shared_components/", "644"],
 ]
 conf-files = ["/etc/dog-agent/agent.conf"]
 maintainer-scripts = "debian/"
@@ -109,11 +109,11 @@ assets = [
     { source = "config.example.toml", dest = "/etc/dog-agent/agent.conf.example", mode = "644" },
     { source = "debian/dog-agent.service", dest = "/usr/lib/systemd/system/dog-agent.service", mode = "644" },
     { source = "debian/dog-agent.tmpfiles", dest = "/usr/lib/tmpfiles.d/dog-agent.conf", mode = "644" },
-    { source = "vendor/linux-security-audit/linux_security_audit.py", dest = "/opt/sentinelsuite/cybersheppard/linux-security-audit/linux_security_audit.py", mode = "644" },
-    { source = "vendor/linux-security-audit/LICENSE", dest = "/opt/sentinelsuite/cybersheppard/linux-security-audit/LICENSE", mode = "644" },
-    { source = "vendor/linux-security-audit/UPSTREAM_COMMIT.txt", dest = "/opt/sentinelsuite/cybersheppard/linux-security-audit/UPSTREAM_COMMIT.txt", mode = "644" },
-    { source = "vendor/linux-security-audit/modules/*.py", dest = "/opt/sentinelsuite/cybersheppard/linux-security-audit/modules/", mode = "644" },
-    { source = "vendor/linux-security-audit/shared_components/*.py", dest = "/opt/sentinelsuite/cybersheppard/linux-security-audit/shared_components/", mode = "644" },
+    { source = "vendor/linux-security-audit/linux_security_audit.py", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/linux_security_audit.py", mode = "644" },
+    { source = "vendor/linux-security-audit/LICENSE", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/LICENSE", mode = "644" },
+    { source = "vendor/linux-security-audit/UPSTREAM_COMMIT.txt", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/UPSTREAM_COMMIT.txt", mode = "644" },
+    { source = "vendor/linux-security-audit/modules/*.py", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/modules/", mode = "644" },
+    { source = "vendor/linux-security-audit/shared_components/*.py", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/shared_components/", mode = "644" },
 ]
 post_install_script = """
 #!/bin/sh

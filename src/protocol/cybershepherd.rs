@@ -1,4 +1,4 @@
-/// Protocollo WebSocket CyberSheppard — tipi di messaggio Agent ↔ Server.
+/// Protocollo WebSocket CyberShepherd — tipi di messaggio Agent ↔ Server.
 ///
 /// Flusso:
 ///   1. Agent si connette e invia `Auth`

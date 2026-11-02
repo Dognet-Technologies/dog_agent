@@ -1,4 +1,4 @@
-/// Connessione WebSocket condivisa da tutti i target (firedog, cybersheppard,
+/// Connessione WebSocket condivisa da tutti i target (firedog, cybershepherd,
 /// sentinelcore). Per `wss://` accetta certificati self-signed: il master
 /// della suite genera un certificato self-signed di default (uso LAN, vedi
 /// deploy/install.sh su FireDog/SentinelCore) — stessa fiducia già accettata

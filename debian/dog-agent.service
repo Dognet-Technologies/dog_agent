@@ -1,5 +1,5 @@
 [Unit]
-Description=Dognet Unified Agent (FireDog / CyberSheppard / SentinelCore)
+Description=Dognet Unified Agent (FireDog / CyberShepherd / SentinelCore)
 Documentation=https://github.com/dognet/dog-agent
 After=network-online.target
 Wants=network-online.target

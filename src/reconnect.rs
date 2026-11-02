@@ -1,5 +1,5 @@
 /// Strategia di riconnessione a due livelli, condivisa dai target che si
-/// connettono via WebSocket (cybersheppard, firedog).
+/// connettono via WebSocket (cybershepherd, firedog).
 ///
 /// Il difetto del vecchio backoff esponenziale puro: un attacco/errore
 /// isolato dopo una sessione lunga e sana ereditava il ritardo massimo

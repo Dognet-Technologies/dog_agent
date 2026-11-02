@@ -1,5 +1,5 @@
 // ============================================================================
-// Hardening executor (agent side) — applica un template CyberSheppard sul target
+// Hardening executor (agent side) — applica un template CyberShepherd sul target
 // ============================================================================
 // Riceve `template_config` (JSON derivato dal YAML) e lo applica.
 // Struttura: template.hardening_steps[] (= controlli) → step.tasks[] (azioni).
@@ -535,7 +535,7 @@ fn act_cron(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String,
     let entry = s(task, "entry").ok_or("entry mancante")?;
     if dry { return Ok(format!("scriverebbe cron {}", file)); }
     record_backup(backups, file);
-    let mut body = String::from("# CyberSheppard hardening\n");
+    let mut body = String::from("# CyberShepherd hardening\n");
     body.push_str(entry); body.push('\n');
     std::fs::write(file, body).map_err(|e| format!("write {}: {}", file, e))?;
     let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644));

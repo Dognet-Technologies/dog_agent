@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
 /// Metriche di sistema: CPU, memoria, disco, rete, uptime, load average.
-/// Usate sia dal heartbeat FireDog che dal collector CyberSheppard.
+/// Usate sia dal heartbeat FireDog che dal collector CyberShepherd.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
     pub cpu_percent: f32,

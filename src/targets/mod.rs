@@ -1,4 +1,4 @@
-mod cybersheppard;
+mod cybershepherd;
 mod firedog;
 pub(crate) mod hardening;
 mod security_audit;
@@ -17,7 +17,7 @@ pub async fn spawn_target(target: TargetConfig) {
 
     let result = match target.system_type {
         SystemType::Firedog => firedog::run(target).await,
-        SystemType::Cybersheppard => cybersheppard::run(target).await,
+        SystemType::Cybershepherd => cybershepherd::run(target).await,
         SystemType::Sentinelcore => sentinelcore::run(target).await,
     };
 
