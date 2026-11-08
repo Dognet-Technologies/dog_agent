@@ -254,9 +254,21 @@ impl TargetConfig {
                 }
             }
             SystemType::Cybershepherd => {
-                if self.target_id.is_none() {
+                // target_id è obbligatorio SOLO sul percorso legacy ad auth-token:
+                // col pairing per-identità (ip+hostname+mac tutti presenti) il
+                // target viene risolto lato server dall'identity_hash — vedi
+                // AgentMessage::PairRequest sopra ("target_id può essere 0,
+                // ignorato") e targets/cybershepherd.rs::use_pairing. Prima di
+                // questo fix la validazione lo richiedeva comunque, impedendo
+                // di configurare un target nuovo (nessun target_id noto finché
+                // non esiste ancora sul master) nonostante il pairing per
+                // identità non ne avesse bisogno — trovato dal vivo, 2026-11-08.
+                let has_identity = self.ip.as_deref().is_some_and(|v| !v.is_empty())
+                    && self.hostname.as_deref().is_some_and(|v| !v.is_empty())
+                    && self.mac.as_deref().is_some_and(|v| !v.is_empty());
+                if self.target_id.is_none() && !has_identity {
                     anyhow::bail!(
-                        "Target '{}' (cybershepherd): target_id è obbligatorio",
+                        "Target '{}' (cybershepherd): serve target_id oppure ip+hostname+mac (pairing per identità)",
                         self.name
                     );
                 }
@@ -410,5 +422,41 @@ mod system_type_tests {
     fn accepts_new_and_legacy_cybershepherd_names() {
         assert_eq!(parse("cybershepherd"), SystemType::Cybershepherd);
         assert_eq!(parse("cybersheppard"), SystemType::Cybershepherd);
+    }
+}
+
+#[cfg(test)]
+mod cybershepherd_validate_tests {
+    use super::TargetConfig;
+
+    fn target(extra: &str) -> TargetConfig {
+        toml::from_str(&format!(
+            "name = \"t\"\nsystem_type = \"cybershepherd\"\nurl = \"wss://x\"\napi_key = \"k\"\n{extra}"
+        ))
+        .expect("toml valido")
+    }
+
+    #[test]
+    fn valido_con_solo_target_id() {
+        assert!(target("target_id = 1").validate().is_ok());
+    }
+
+    // Regressione: prima del fix, un target configurato per il pairing per
+    // identità (senza target_id, non ancora noto finché il master non crea
+    // il target) veniva respinto da validate() pur essendo esattamente lo
+    // scenario che AgentMessage::PairRequest supporta ("target_id può essere
+    // 0, ignorato: il target è risolto per identità").
+    #[test]
+    fn valido_con_sola_identita_di_pairing_senza_target_id() {
+        let t = target("ip = \"10.10.0.18\"\nhostname = \"h\"\nmac = \"aa:bb:cc:dd:ee:ff\"");
+        assert!(t.target_id.is_none());
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn invalido_senza_target_id_ne_identita_completa() {
+        assert!(target("").validate().is_err());
+        // Identità parziale (manca mac) non basta neppure lei.
+        assert!(target("ip = \"10.10.0.18\"\nhostname = \"h\"").validate().is_err());
     }
 }
