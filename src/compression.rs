@@ -1,4 +1,4 @@
-/// Wrapper Zstd per la compressione dei payload CyberShepherd.
+//! Wrapper Zstd per la compressione dei payload CyberShepherd.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -47,7 +47,7 @@ pub fn decompress_payload(payload: &CompressedPayload) -> Result<Vec<u8>> {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
         let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
@@ -69,7 +69,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
             b'+' => Ok(62),
             b'/' => Ok(63),
             b'=' => Ok(0),
-            _ => anyhow::bail!("carattere base64 non valido: {}", c),
+            _ => anyhow::bail!("carattere base64 non valido: {c}"),
         }
     }
     let bytes = s.as_bytes();

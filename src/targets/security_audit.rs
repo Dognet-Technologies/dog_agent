@@ -23,7 +23,7 @@ pub struct SecurityAuditOutcome {
 /// restituisce i risultati grezzi. Non applica mai `--remediate`.
 pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
     if !Path::new(AUDIT_SCRIPT).exists() {
-        return unavailable(format!("{} non trovato sul target", AUDIT_SCRIPT));
+        return unavailable(format!("{AUDIT_SCRIPT} non trovato sul target"));
     }
     if !python3_available() {
         return unavailable("python3 non disponibile sul target".to_string());
@@ -44,13 +44,13 @@ pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
 
     let raw = match std::fs::read_to_string(&out_path) {
         Ok(s) => s,
-        Err(e) => return failed(format!("lettura output fallita (exit {}): {}", code, e)),
+        Err(e) => return failed(format!("lettura output fallita (exit {code}): {e}")),
     };
     let _ = std::fs::remove_file(&out_path);
 
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
-        Err(e) => return failed(format!("JSON non valido: {}", e)),
+        Err(e) => return failed(format!("JSON non valido: {e}")),
     };
 
     let results: Vec<Value> = parsed

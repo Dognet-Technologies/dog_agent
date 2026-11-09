@@ -1,8 +1,8 @@
-/// Implementazione protocollo CyberShepherd.
-///
-/// Lifecycle:
-///   connect → auth → [collect metrics → buffer → flush compresso ogni send_interval]
-///   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
+//! Implementazione protocollo CyberShepherd.
+//!
+//! Lifecycle:
+//!   connect → auth → [collect metrics → buffer → flush compresso ogni send_interval]
+//!   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -156,7 +156,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
                         handle_server_message(config, &out, &text, target_id).await?;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        out.send(Message::Pong(data)).map_err(|e| anyhow::anyhow!("channel: {}", e))?;
+                        out.send(Message::Pong(data)).map_err(|e| anyhow::anyhow!("channel: {e}"))?;
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("[{}] Server ha chiuso la connessione", config.name);
@@ -283,7 +283,7 @@ fn flush_buffer(
     };
 
     out.send(Message::Text(serde_json::to_string(&msg)?))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
     buffer.clear();
     Ok(())
 }
@@ -312,7 +312,7 @@ fn flush_security_events(
         payload: compressed,
     };
     out.send(Message::Text(serde_json::to_string(&msg)?))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
     Ok(())
 }
 
@@ -402,7 +402,7 @@ async fn handle_server_message(
                     },
                 };
                 out.send(Message::Text(serde_json::to_string(&resp)?))
-                    .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
             }
         }
         ServerMessage::AuthAck { .. } => {
@@ -479,7 +479,7 @@ async fn run_hardening_command(
             None,
         )?;
     }
-    let outcome = handle.await.map_err(|e| anyhow::anyhow!("join hardening: {}", e))?;
+    let outcome = handle.await.map_err(|e| anyhow::anyhow!("join hardening: {e}"))?;
 
     let progress = serde_json::json!({
         "total_controls": outcome.total_controls,
@@ -517,7 +517,7 @@ async fn run_security_audit_command(
 
     let outcome = tokio::task::spawn_blocking(move || super::security_audit::run_security_audit(&modules))
         .await
-        .map_err(|e| anyhow::anyhow!("join security_audit: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("join security_audit: {e}"))?;
 
     let results_compressed = crate::compression::compress_json(&outcome.results, config.compression_level)
         .ok()
@@ -536,7 +536,7 @@ async fn run_security_audit_command(
         }
     });
     out.send(Message::Text(msg.to_string()))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
 
     info!("[{}] Security audit exec {} → {}", config.name, exec_id, outcome.status);
     Ok(())
@@ -561,7 +561,7 @@ async fn run_apply_remediation_command(
 
     let outcome = tokio::task::spawn_blocking(move || super::hardening::run_single_task(&task, &mode))
         .await
-        .map_err(|e| anyhow::anyhow!("join apply_remediation: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("join apply_remediation: {e}"))?;
 
     let status = if outcome.ok { "completed" } else { "failed" };
     let msg = serde_json::json!({
@@ -578,7 +578,7 @@ async fn run_apply_remediation_command(
         }
     });
     out.send(Message::Text(msg.to_string()))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
 
     info!("[{}] Apply remediation {} → {}", config.name, apply_id, status);
     Ok(())
@@ -605,7 +605,7 @@ fn send_hardening_status(
     });
     // Inviato via canale al writer task dedicato (flush affidabile e immediato).
     out.send(Message::Text(msg.to_string()))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
     Ok(())
 }
 
@@ -619,7 +619,7 @@ async fn execute_command(cmd: &CommandPayload) -> (bool, Option<String>, Option<
         ),
         other => {
             warn!("Comando CyberShepherd non supportato: {}", other);
-            (false, None, Some(format!("Azione non supportata: {}", other)))
+            (false, None, Some(format!("Azione non supportata: {other}")))
         }
     }
 }

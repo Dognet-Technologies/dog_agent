@@ -73,17 +73,14 @@ impl std::fmt::Display for SystemType {
 /// istanza è il clone di testing/preproduzione o l'originale di produzione.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AgentEnvironment {
+    #[default]
     Production,
     Testing,
     Preproduction,
 }
 
-impl Default for AgentEnvironment {
-    fn default() -> Self {
-        AgentEnvironment::Production
-    }
-}
 
 impl std::fmt::Display for AgentEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -224,9 +221,9 @@ impl TargetConfig {
         let base = base.trim_end_matches('/');
 
         match self.system_type {
-            SystemType::Firedog => format!("{}/ws/agent/", base),
-            SystemType::Cybershepherd => format!("{}/api/agents/ws", base),
-            SystemType::Sentinelcore => format!("{}/ws/agent/", base),
+            SystemType::Firedog => format!("{base}/ws/agent/"),
+            SystemType::Cybershepherd => format!("{base}/api/agents/ws"),
+            SystemType::Sentinelcore => format!("{base}/ws/agent/"),
         }
     }
 

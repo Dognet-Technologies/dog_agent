@@ -1,8 +1,8 @@
-/// Implementazione protocollo FireDog.
-///
-/// Lifecycle:
-///   connect → pair → [heartbeat loop + command handling + threat reporting]
-///   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
+//! Implementazione protocollo FireDog.
+//!
+//! Lifecycle:
+//!   connect → pair → [heartbeat loop + command handling + threat reporting]
+//!   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -279,25 +279,25 @@ async fn execute_command(
         CommandAction::AddRule => {
             match serde_json::from_value::<AddRulePayload>(payload) {
                 Ok(p) => fw.add_rule(&p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
             }
         }
         CommandAction::RemoveRule => {
             match serde_json::from_value::<RemoveRulePayload>(payload) {
                 Ok(p) => fw.remove_rule(&p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
             }
         }
         CommandAction::BlockIp => {
             match serde_json::from_value::<BlockIpPayload>(payload) {
                 Ok(p) => fw.block_ip(&p.ip, &p.direction),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
             }
         }
         CommandAction::UnblockIp => {
             match serde_json::from_value::<BlockIpPayload>(payload) {
                 Ok(p) => fw.unblock_ip(&p.ip, &p.direction),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
             }
         }
         CommandAction::SyncRules => {
@@ -313,13 +313,13 @@ async fn execute_command(
         CommandAction::UpdateConfig => {
             match serde_json::from_value::<ThreatConfigUpdatePayload>(payload) {
                 Ok(p) => update_threat_config(config, &p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
             }
         }
         CommandAction::UpdatePcapConfig => {
             match serde_json::from_value::<PcapConfigUpdatePayload>(payload) {
                 Ok(p) => update_pcap_config(&p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
             }
         }
         CommandAction::Unknown => {
@@ -438,7 +438,7 @@ fn update_target_config_file(
             let mut name_matches = false;
             while j < lines.len() && !lines[j].trim_start().starts_with("[[targets]]") {
                 let trimmed = lines[j].trim_start();
-                if trimmed.starts_with("name") && trimmed.contains(&format!("\"{}\"", target_name)) {
+                if trimmed.starts_with("name") && trimmed.contains(&format!("\"{target_name}\"")) {
                     name_matches = true;
                 }
                 j += 1;
@@ -464,7 +464,7 @@ fn update_target_config_file(
         for (key, value) in updates {
             if let Some(rest) = trimmed.strip_prefix(key) {
                 if rest.trim_start().starts_with('=') {
-                    *line = format!("{} = {}", key, value);
+                    *line = format!("{key} = {value}");
                     remaining.retain(|k| k != key);
                 }
             }
@@ -472,7 +472,7 @@ fn update_target_config_file(
     }
     for key in remaining {
         let value = &updates.iter().find(|(k, _)| *k == key).unwrap().1;
-        lines.insert(block_end, format!("{} = {}", key, value));
+        lines.insert(block_end, format!("{key} = {value}"));
         block_end += 1;
     }
 
@@ -521,7 +521,7 @@ const VALID_THREAT_COMMAND_KEYS: [&str; 5] =
 fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
     if let Some(ref tool) = p.pcap_analysis_tool {
         if tool != "tcpdump" && tool != "tshark" {
-            anyhow::bail!("pcap_analysis_tool non valido: '{}' (atteso tcpdump|tshark)", tool);
+            anyhow::bail!("pcap_analysis_tool non valido: '{tool}' (atteso tcpdump|tshark)");
         }
     }
     if let Some(ref save_path) = p.pcap_save_path {
@@ -535,7 +535,7 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
     if let Some(ref commands) = p.pcap_threat_commands {
         for c in commands {
             if !VALID_THREAT_COMMAND_KEYS.contains(&c.as_str()) {
-                anyhow::bail!("pcap_threat_commands: chiave sconosciuta '{}'", c);
+                anyhow::bail!("pcap_threat_commands: chiave sconosciuta '{c}'");
             }
         }
     }
@@ -575,7 +575,7 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
     std::fs::write(path, lines.join("\n") + "\n")
         .with_context(|| format!("Impossibile scrivere {}", path.display()))?;
 
-    Ok(format!("Config pcap aggiornata ({} campi)", changed))
+    Ok(format!("Config pcap aggiornata ({changed} campi)"))
 }
 
 /// Racchiude `value` tra apici singoli, escapando gli apici letterali
@@ -601,10 +601,10 @@ fn bash_single_quote(value: &str) -> String {
 /// a prescindere dal quoting.
 fn reject_unsafe_conf_value(field: &str, value: &str) -> Result<()> {
     if value.contains('\'') {
-        anyhow::bail!("{}: non può contenere l'apice singolo (')", field);
+        anyhow::bail!("{field}: non può contenere l'apice singolo (')");
     }
     if value.contains('\n') || value.contains('\r') {
-        anyhow::bail!("{}: non può contenere newline", field);
+        anyhow::bail!("{field}: non può contenere newline");
     }
     Ok(())
 }
@@ -624,12 +624,12 @@ fn upsert_conf_line(lines: &mut Vec<String>, key: &str, value: &str) {
         }
         if let Some(rest) = trimmed.strip_prefix(key) {
             if rest.starts_with('=') {
-                *line = format!("{}={}", key, quoted);
+                *line = format!("{key}={quoted}");
                 return;
             }
         }
     }
-    lines.push(format!("{}={}", key, quoted));
+    lines.push(format!("{key}={quoted}"));
 }
 
 /// Rimuove tutte le righe (non-commento) la cui chiave inizia con `prefix` —

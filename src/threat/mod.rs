@@ -1,12 +1,12 @@
-/// Rilevamento minacce locale per FireDog.
-///
-/// Analizza log di sistema per identificare pattern sospetti:
-/// - Brute force SSH/FTP (tentativi falliti ripetuti)
-/// - Port scan (molte connessioni a porte diverse dallo stesso IP)
-/// - SYN flood (rilevato via /proc/net/tcp)
-///
-/// Ogni minaccia riceve uno score 0-100.
-/// Se score >= threshold e auto_block=true, applica blocco locale via iptables.
+//! Rilevamento minacce locale per FireDog.
+//!
+//! Analizza log di sistema per identificare pattern sospetti:
+//! - Brute force SSH/FTP (tentativi falliti ripetuti)
+//! - Port scan (molte connessioni a porte diverse dallo stesso IP)
+//! - SYN flood (rilevato via /proc/net/tcp)
+//!
+//! Ogni minaccia riceve uno score 0-100.
+//! Se score >= threshold e auto_block=true, applica blocco locale via iptables.
 
 use tracing::{info, warn};
 
@@ -156,8 +156,7 @@ fn scan_auth_log_sync(min_attempts: u32, score_per_attempt: u32) -> Vec<ThreatEn
                 threat_type: ThreatType::BruteForce,
                 score,
                 description: format!(
-                    "Brute force {} da {} — {} tentativi ({})",
-                    service, ip, count, classification
+                    "Brute force {service} da {ip} — {count} tentativi ({classification})"
                 ),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 auto_blocked: false,
@@ -207,8 +206,7 @@ fn scan_connections_sync(min_connections: u32, score_per_conn: u32) -> Vec<Threa
                 threat_type: ThreatType::SynFlood,
                 score,
                 description: format!(
-                    "SYN flood potenziale da {} — {} SYN_RECV attivi",
-                    ip, count
+                    "SYN flood potenziale da {ip} — {count} SYN_RECV attivi"
                 ),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 auto_blocked: false,

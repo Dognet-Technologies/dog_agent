@@ -38,14 +38,14 @@ pub async fn check_integrity(paths: &[String]) -> Result<Vec<FileHash>> {
     let paths_owned = paths.to_vec();
     tokio::task::spawn_blocking(move || hash_paths(&paths_owned))
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 async fn collect_paths(paths: &[String]) -> Result<FilesMetrics> {
     let paths_owned = paths.to_vec();
     tokio::task::spawn_blocking(move || collect_sync(&paths_owned))
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 fn collect_sync(paths: &[String]) -> Result<FilesMetrics> {

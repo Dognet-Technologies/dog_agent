@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_new(format!("dog_agent={}", log_level))
+            EnvFilter::try_new(format!("dog_agent={log_level}"))
                 .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();

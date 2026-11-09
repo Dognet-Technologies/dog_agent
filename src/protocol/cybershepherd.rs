@@ -1,10 +1,10 @@
-/// Protocollo WebSocket CyberShepherd — tipi di messaggio Agent ↔ Server.
-///
-/// Flusso:
-///   1. Agent si connette e invia `Auth`
-///   2. Server risponde con `AuthAck` (success=true)
-///   3. Agent invia batch di metriche compresse (`Metrics`) ogni send_interval
-///   4. Server può inviare comandi (`Command`), l'agent risponde (`CommandResponse`)
+//! Protocollo WebSocket CyberShepherd — tipi di messaggio Agent ↔ Server.
+//!
+//! Flusso:
+//!   1. Agent si connette e invia `Auth`
+//!   2. Server risponde con `AuthAck` (success=true)
+//!   3. Agent invia batch di metriche compresse (`Metrics`) ogni send_interval
+//!   4. Server può inviare comandi (`Command`), l'agent risponde (`CommandResponse`)
 
 use serde::{Deserialize, Serialize};
 use crate::compression::CompressedPayload;
@@ -62,6 +62,10 @@ pub enum AgentMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "msg_type", rename_all = "snake_case")]
+// Campi del contratto wire: deserializzati dai messaggi del server, non tutti
+// consumati dall'agent (es. target_id/timestamp informativi). Mantenuti per
+// documentare il protocollo e deserializzare correttamente i messaggi.
+#[allow(dead_code)]
 pub enum ServerMessage {
     /// Conferma autenticazione
     AuthAck {

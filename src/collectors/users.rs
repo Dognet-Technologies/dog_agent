@@ -30,7 +30,7 @@ pub struct LoggedInUser {
 pub async fn collect() -> Result<UsersMetrics> {
     tokio::task::spawn_blocking(collect_sync)
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 fn collect_sync() -> Result<UsersMetrics> {
@@ -149,7 +149,7 @@ fn check_root_login() -> bool {
             }
         }
         // Default: root login abilitato se non esplicitamente disabilitato
-        return true;
+        true
     }
 
     #[cfg(not(target_os = "linux"))]

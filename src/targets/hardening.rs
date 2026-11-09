@@ -229,7 +229,7 @@ fn apply_task(action: &str, task: &Value, dry: bool, backups: &mut Vec<Value>) -
         "fstab_entry" => act_fstab(task, dry, backups),
         "command" => act_command(task, dry),
         "script" => act_script(task, dry),
-        other => Err(format!("action non supportata: {}", other)),
+        other => Err(format!("action non supportata: {other}")),
     }
 }
 
@@ -243,7 +243,7 @@ fn record_backup(backups: &mut Vec<Value>, path: &str) {
     backups.push(json!({ "path": path, "existed": existed, "content": content }));
     if existed {
         // copia .bak best-effort per ripristino manuale immediato
-        let _ = std::fs::copy(path, format!("{}.cybersheppard.bak", path));
+        let _ = std::fs::copy(path, format!("{path}.cybersheppard.bak"));
     }
 }
 
@@ -257,8 +257,8 @@ fn apply_owner_mode(path: &str, task: &Value) -> Result<(), String> {
     if let Some(owner) = s(task, "owner") {
         // chown user[:group]
         let status = Command::new("chown").arg(owner).arg(path).status()
-            .map_err(|e| format!("chown: {}", e))?;
-        if !status.success() { return Err(format!("chown {} {} fallito", owner, path)); }
+            .map_err(|e| format!("chown: {e}"))?;
+        if !status.success() { return Err(format!("chown {owner} {path} fallito")); }
     }
     Ok(())
 }
@@ -269,23 +269,23 @@ fn act_file_content(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result
     if dry { return Ok(format!("scriverebbe {} ({} byte)", file, content.len())); }
     if let Some(parent) = std::path::Path::new(file).parent() { let _ = std::fs::create_dir_all(parent); }
     record_backup(backups, file);
-    std::fs::write(file, content).map_err(|e| format!("write {}: {}", file, e))?;
+    std::fs::write(file, content).map_err(|e| format!("write {file}: {e}"))?;
     apply_owner_mode(file, task)?;
-    Ok(format!("scritto {}", file))
+    Ok(format!("scritto {file}"))
 }
 
 fn act_file_copy(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let src = s(task, "src").ok_or("src mancante")?;
     let dest = s(task, "dest").ok_or("dest mancante")?;
-    if dry { return Ok(format!("copierebbe {} → {}", src, dest)); }
+    if dry { return Ok(format!("copierebbe {src} → {dest}")); }
     if !std::path::Path::new(src).exists() {
-        return Err(format!("src {} non presente sul target", src));
+        return Err(format!("src {src} non presente sul target"));
     }
     if let Some(parent) = std::path::Path::new(dest).parent() { let _ = std::fs::create_dir_all(parent); }
     record_backup(backups, dest);
-    std::fs::copy(src, dest).map_err(|e| format!("copy: {}", e))?;
+    std::fs::copy(src, dest).map_err(|e| format!("copy: {e}"))?;
     apply_owner_mode(dest, task)?;
-    Ok(format!("copiato → {}", dest))
+    Ok(format!("copiato → {dest}"))
 }
 
 /// Assicura che una o più righe siano presenti in un file. Supporta sia
@@ -401,21 +401,19 @@ fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
     }
 
     if inserted == 0 && replaced == 0 {
-        return Ok(format!("{} riga/e già presenti in {}", already, file));
+        return Ok(format!("{already} riga/e già presenti in {file}"));
     }
     if dry {
         return Ok(format!(
-            "aggiornerebbe {} ({} da aggiungere, {} da sostituire)",
-            file, inserted, replaced
+            "aggiornerebbe {file} ({inserted} da aggiungere, {replaced} da sostituire)"
         ));
     }
     record_backup(backups, file);
     let mut joined = out.join("\n");
     joined.push('\n');
-    std::fs::write(file, joined).map_err(|e| format!("write {}: {}", file, e))?;
+    std::fs::write(file, joined).map_err(|e| format!("write {file}: {e}"))?;
     Ok(format!(
-        "{} ({} aggiunte, {} sostituite)",
-        file, inserted, replaced
+        "{file} ({inserted} aggiunte, {replaced} sostituite)"
     ))
 }
 
@@ -424,14 +422,14 @@ fn act_file_line_replace(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
     let search = s(task, "search").ok_or("search mancante")?;
     let replace = s(task, "replace").unwrap_or("");
     let create_if_missing = task.get("create_if_missing").and_then(|v| v.as_bool()).unwrap_or(false);
-    let re = regex::Regex::new(search).map_err(|e| format!("regex '{}': {}", search, e))?;
+    let re = regex::Regex::new(search).map_err(|e| format!("regex '{search}': {e}"))?;
     let existing = std::fs::read_to_string(file).unwrap_or_default();
     let matched = existing.lines().any(|l| re.is_match(l));
 
     if dry {
-        return Ok(if matched { format!("sostituirebbe in {}", file) }
-                  else if create_if_missing { format!("aggiungerebbe (non trovato) in {}", file) }
-                  else { format!("nessun match in {} (nessuna modifica)", file) });
+        return Ok(if matched { format!("sostituirebbe in {file}") }
+                  else if create_if_missing { format!("aggiungerebbe (non trovato) in {file}") }
+                  else { format!("nessun match in {file} (nessuna modifica)") });
     }
     record_backup(backups, file);
     let mut out: Vec<String> = Vec::new();
@@ -440,8 +438,8 @@ fn act_file_line_replace(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
     }
     if !matched && create_if_missing { out.push(replace.to_string()); }
     let mut joined = out.join("\n"); joined.push('\n');
-    std::fs::write(file, joined).map_err(|e| format!("write {}: {}", file, e))?;
-    Ok(format!("aggiornato {}", file))
+    std::fs::write(file, joined).map_err(|e| format!("write {file}: {e}"))?;
+    Ok(format!("aggiornato {file}"))
 }
 
 fn act_file_section_update(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
@@ -451,25 +449,25 @@ fn act_file_section_update(task: &Value, dry: bool, backups: &mut Vec<Value>) ->
     let content = s(task, "content").ok_or("content mancante")?;
     let existing = std::fs::read_to_string(file).unwrap_or_default();
     if existing.contains(content.trim()) {
-        return Ok(format!("sezione già presente in {}", file));
+        return Ok(format!("sezione già presente in {file}"));
     }
-    if dry { return Ok(format!("aggiornerebbe sezione in {}", file)); }
+    if dry { return Ok(format!("aggiornerebbe sezione in {file}")); }
     record_backup(backups, file);
     let mut new = existing;
     if !new.is_empty() && !new.ends_with('\n') { new.push('\n'); }
     new.push_str(content); new.push('\n');
-    std::fs::write(file, new).map_err(|e| format!("write {}: {}", file, e))?;
-    Ok(format!("sezione aggiornata in {}", file))
+    std::fs::write(file, new).map_err(|e| format!("write {file}: {e}"))?;
+    Ok(format!("sezione aggiornata in {file}"))
 }
 
 fn act_sysctl(task: &Value, dry: bool) -> Result<String, String> {
     let param = s(task, "parameter").ok_or("parameter mancante")?;
     let value = task.get("value").map(|v| v.to_string().trim_matches('"').to_string())
         .ok_or("value mancante")?;
-    if dry { return Ok(format!("sysctl {}={}", param, value)); }
+    if dry { return Ok(format!("sysctl {param}={value}")); }
     // Persistente + runtime.
-    let conf = format!("/etc/sysctl.d/99-cybersheppard-hardening.conf");
-    let line = format!("{} = {}", param, value);
+    let conf = "/etc/sysctl.d/99-cybersheppard-hardening.conf".to_string();
+    let line = format!("{param} = {value}");
     let existing = std::fs::read_to_string(&conf).unwrap_or_default();
     if !existing.lines().any(|l| l.trim_start().starts_with(param)) {
         let mut new = existing;
@@ -477,10 +475,10 @@ fn act_sysctl(task: &Value, dry: bool) -> Result<String, String> {
         new.push_str(&line); new.push('\n');
         let _ = std::fs::write(&conf, new);
     }
-    let status = Command::new("sysctl").arg("-w").arg(format!("{}={}", param, value)).status()
-        .map_err(|e| format!("sysctl: {}", e))?;
-    if !status.success() { return Err(format!("sysctl -w {}={} fallito", param, value)); }
-    Ok(format!("sysctl {}={}", param, value))
+    let status = Command::new("sysctl").arg("-w").arg(format!("{param}={value}")).status()
+        .map_err(|e| format!("sysctl: {e}"))?;
+    if !status.success() { return Err(format!("sysctl -w {param}={value} fallito")); }
+    Ok(format!("sysctl {param}={value}"))
 }
 
 fn act_systemd(task: &Value, dry: bool) -> Result<String, String> {
@@ -492,11 +490,11 @@ fn act_systemd(task: &Value, dry: bool) -> Result<String, String> {
         "masked" | "mask" => vec!["mask"],
         "stopped" | "stop" => vec!["stop"],
         "started" | "start" => vec!["start"],
-        other => return Err(format!("state systemd sconosciuto: {}", other)),
+        other => return Err(format!("state systemd sconosciuto: {other}")),
     };
     if dry { return Ok(format!("systemctl {} {}", args.join(" "), svc)); }
     let status = Command::new("systemctl").args(&args).arg(svc).status()
-        .map_err(|e| format!("systemctl: {}", e))?;
+        .map_err(|e| format!("systemctl: {e}"))?;
     if !status.success() { return Err(format!("systemctl {} {} fallito", args.join(" "), svc)); }
     Ok(format!("systemctl {} {}", args.join(" "), svc))
 }
@@ -512,34 +510,33 @@ fn act_package_install(task: &Value, dry: bool) -> Result<String, String> {
     // irraggiungibili). Il timeout complessivo del task fa da rete di sicurezza.
     let cmdline = match detect_pkg_mgr().as_str() {
         "apt" => format!(
-            "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=30 install -y {}",
-            list
+            "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=30 install -y {list}"
         ),
-        "zypper" => format!("zypper --non-interactive install {}", list),
-        "dnf" => format!("dnf install -y --setopt=timeout=20 {}", list),
-        m => return Err(format!("package manager non supportato: {}", m)),
+        "zypper" => format!("zypper --non-interactive install {list}"),
+        "dnf" => format!("dnf install -y --setopt=timeout=20 {list}"),
+        m => return Err(format!("package manager non supportato: {m}")),
     };
     let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(180);
     let (code, out, timed_out) = run_shell(&cmdline, secs);
     if timed_out {
-        return Err(format!("timeout install {} dopo {}s (mirror irraggiungibile?)", list, secs));
+        return Err(format!("timeout install {list} dopo {secs}s (mirror irraggiungibile?)"));
     }
     if code != 0 {
         return Err(format!("install {} fallito (exit {}): {}", list, code, out.lines().last().unwrap_or("")));
     }
-    Ok(format!("installati: {}", list))
+    Ok(format!("installati: {list}"))
 }
 
 fn act_cron(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "cron_file").ok_or("cron_file mancante")?;
     let entry = s(task, "entry").ok_or("entry mancante")?;
-    if dry { return Ok(format!("scriverebbe cron {}", file)); }
+    if dry { return Ok(format!("scriverebbe cron {file}")); }
     record_backup(backups, file);
     let mut body = String::from("# CyberShepherd hardening\n");
     body.push_str(entry); body.push('\n');
-    std::fs::write(file, body).map_err(|e| format!("write {}: {}", file, e))?;
+    std::fs::write(file, body).map_err(|e| format!("write {file}: {e}"))?;
     let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644));
-    Ok(format!("cron scritto {}", file))
+    Ok(format!("cron scritto {file}"))
 }
 
 fn act_fstab(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
@@ -552,8 +549,8 @@ fn act_fstab(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String
         let f: Vec<&str> = l.split_whitespace().collect();
         f.len() >= 2 && f[1] == mount && !l.trim_start().starts_with('#')
     });
-    if !has_line { return Err(format!("mount {} non presente in fstab (skip)", mount)); }
-    if dry { return Ok(format!("aggiornerebbe opzioni fstab per {} → {}", mount, options)); }
+    if !has_line { return Err(format!("mount {mount} non presente in fstab (skip)")); }
+    if dry { return Ok(format!("aggiornerebbe opzioni fstab per {mount} → {options}")); }
     record_backup(backups, fstab);
     let mut out: Vec<String> = Vec::new();
     for l in existing.lines() {
@@ -564,8 +561,8 @@ fn act_fstab(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String
         } else { out.push(l.to_string()); }
     }
     let mut joined = out.join("\n"); joined.push('\n');
-    std::fs::write(fstab, joined).map_err(|e| format!("write fstab: {}", e))?;
-    Ok(format!("fstab aggiornato per {}", mount))
+    std::fs::write(fstab, joined).map_err(|e| format!("write fstab: {e}"))?;
+    Ok(format!("fstab aggiornato per {mount}"))
 }
 
 fn act_command(task: &Value, dry: bool) -> Result<String, String> {
@@ -580,7 +577,7 @@ fn act_command(task: &Value, dry: bool) -> Result<String, String> {
     if code as i64 != expected {
         return Err(format!("exit {} (atteso {}): {}", code, expected, out.lines().last().unwrap_or("")));
     }
-    Ok(format!("comando ok (exit {})", code))
+    Ok(format!("comando ok (exit {code})"))
 }
 
 fn act_script(task: &Value, dry: bool) -> Result<String, String> {
@@ -588,7 +585,7 @@ fn act_script(task: &Value, dry: bool) -> Result<String, String> {
     if dry { return Ok(format!("eseguirebbe script ({} righe)", script.lines().count())); }
     let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
     let (code, out, timed_out) = run_shell(script, secs);
-    if timed_out { return Err(format!("timeout dopo {}s", secs)); }
+    if timed_out { return Err(format!("timeout dopo {secs}s")); }
     if code != 0 {
         // L'output (stdout+stderr uniti) è indispensabile per capire PERCHÉ uno
         // script è fallito (es. quale comando ha dato errore) - scartarlo qui
@@ -646,7 +643,7 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
         .spawn();
     let mut child = match spawn {
         Ok(c) => c,
-        Err(e) => return (-1, format!("spawn error: {}", e), false),
+        Err(e) => return (-1, format!("spawn error: {e}"), false),
     };
     let pid = child.id() as i32;
     let start = Instant::now();
@@ -662,7 +659,7 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
                 if start.elapsed() >= Duration::from_secs(timeout_secs) {
                     timed_out = true;
                     // Best-effort: uccide il gruppo (bash + figli); poi il diretto.
-                    let _ = Command::new("kill").arg("-9").arg(format!("-{}", pid)).status();
+                    let _ = Command::new("kill").arg("-9").arg(format!("-{pid}")).status();
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -871,7 +868,7 @@ mod tests {
         // 2026-09-20). Verifica che uno script con newline/righe vuote
         // finali venga comunque esteguito correttamente.
         let (_f, path) = tmp_file("");
-        let script = format!("echo ciao > {}\n\n", path);
+        let script = format!("echo ciao > {path}\n\n");
         let task = json!({ "script": script });
         let msg = act_script(&task, false).unwrap();
         assert_eq!(msg, "script ok");

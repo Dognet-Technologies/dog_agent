@@ -1,9 +1,9 @@
-/// SentinelCore — stub predisposto per implementazione futura.
-///
-/// Per ora: si connette, logga che il sistema non è ancora implementato
-/// e rimane in idle loop attendendo comandi (nessuno per ora).
-/// Quando le specifiche API SentinelCore saranno disponibili,
-/// basterà implementare questo modulo senza toccare il resto del codice.
+//! SentinelCore — stub predisposto per implementazione futura.
+//!
+//! Per ora: si connette, logga che il sistema non è ancora implementato
+//! e rimane in idle loop attendendo comandi (nessuno per ora).
+//! Quando le specifiche API SentinelCore saranno disponibili,
+//! basterà implementare questo modulo senza toccare il resto del codice.
 
 use anyhow::Result;
 use std::time::Duration;

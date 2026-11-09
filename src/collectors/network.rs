@@ -40,7 +40,7 @@ pub struct TcpConnection {
 pub async fn collect() -> Result<NetworkMetrics> {
     tokio::task::spawn_blocking(collect_sync)
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 fn collect_sync() -> Result<NetworkMetrics> {

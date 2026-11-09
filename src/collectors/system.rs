@@ -23,7 +23,7 @@ pub struct SystemMetrics {
 pub async fn collect() -> Result<SystemMetrics> {
     tokio::task::spawn_blocking(collect_sync)
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 fn collect_sync() -> Result<SystemMetrics> {
@@ -57,8 +57,8 @@ fn collect_sync() -> Result<SystemMetrics> {
 
     // Rete: somma di tutte le interfacce
     let networks = sysinfo::Networks::new_with_refreshed_list();
-    let bytes_sent: u64 = networks.iter().map(|(_, n)| n.total_transmitted()).sum();
-    let bytes_recv: u64 = networks.iter().map(|(_, n)| n.total_received()).sum();
+    let bytes_sent: u64 = networks.values().map(|n| n.total_transmitted()).sum();
+    let bytes_recv: u64 = networks.values().map(|n| n.total_received()).sum();
 
     let uptime_seconds = System::uptime();
 

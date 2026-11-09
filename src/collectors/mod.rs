@@ -67,7 +67,7 @@ pub async fn collect_all(config: &TargetConfig) -> Result<AllMetrics> {
         if c.files { files::collect().await.ok() } else { None }
     };
     let svc_fut = async {
-        if c.services { services::collect().await.ok() } else { None }
+        if c.services { services::collect(c.docker).await.ok() } else { None }
     };
     let aud_fut = async {
         if c.auditd { auditd::collect().await.ok() } else { None }

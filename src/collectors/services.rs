@@ -26,15 +26,21 @@ pub struct ContainerStatus {
     pub status: String, // "Up 2 hours" | "Exited (0) 5 minutes ago"
 }
 
-pub async fn collect() -> Result<ServicesMetrics> {
-    tokio::task::spawn_blocking(collect_sync)
+pub async fn collect(include_docker: bool) -> Result<ServicesMetrics> {
+    tokio::task::spawn_blocking(move || collect_sync(include_docker))
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
-fn collect_sync() -> Result<ServicesMetrics> {
+fn collect_sync(include_docker: bool) -> Result<ServicesMetrics> {
     let systemd_services = collect_systemd();
-    let docker_containers = collect_docker();
+    // Il flag collectors.docker permette di escludere l'inventario dei
+    // container senza spegnere l'intero collector services.
+    let docker_containers = if include_docker {
+        collect_docker()
+    } else {
+        Vec::new()
+    };
 
     Ok(ServicesMetrics {
         systemd_services,

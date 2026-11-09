@@ -1,10 +1,10 @@
-/// Wrapper iptables per FireDog.
-///
-/// Su Linux esegue comandi iptables tramite std::process::Command.
-/// Su Windows restituisce errori (non applicabile).
-///
-/// Il FirewallManager tiene traccia in memoria delle regole aggiunte
-/// e degli IP bloccati durante la sessione corrente.
+//! Wrapper iptables per FireDog.
+//!
+//! Su Linux esegue comandi iptables tramite std::process::Command.
+//! Su Windows restituisce errori (non applicabile).
+//!
+//! Il FirewallManager tiene traccia in memoria delle regole aggiunte
+//! e degli IP bloccati durante la sessione corrente.
 
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -60,7 +60,7 @@ impl FirewallManager {
 
         let pretty = args
             .iter()
-            .map(|a| if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() })
+            .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
             .collect::<Vec<_>>()
             .join(" ");
         self.state.lock().unwrap().active_rules.push(RuleRecord {
@@ -69,7 +69,7 @@ impl FirewallManager {
         });
 
         info!("Regola aggiunta: iptables {}", pretty);
-        Ok(format!("Regola aggiunta: iptables {}", pretty))
+        Ok(format!("Regola aggiunta: iptables {pretty}"))
     }
 
     pub fn remove_rule(&self, p: &RemoveRulePayload) -> Result<String> {
@@ -125,7 +125,7 @@ impl FirewallManager {
 
         self.state.lock().unwrap().blocked_ips.push(ip.to_string());
         info!("IP bloccato: {} ({})", ip, direction);
-        Ok(format!("IP {} bloccato ({})", ip, direction))
+        Ok(format!("IP {ip} bloccato ({direction})"))
     }
 
     pub fn unblock_ip(&self, ip: &str, direction: &str) -> Result<String> {
@@ -144,7 +144,7 @@ impl FirewallManager {
 
         self.state.lock().unwrap().blocked_ips.retain(|b| b != ip);
         info!("IP sbloccato: {}", ip);
-        Ok(format!("IP {} sbloccato", ip))
+        Ok(format!("IP {ip} sbloccato"))
     }
 
     pub fn sync_rules(&self) -> Result<String> {
