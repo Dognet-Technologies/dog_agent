@@ -50,6 +50,12 @@ impl FirewallManager {
     // ── Comandi pubblici ──────────────────────────────────────────────────────
 
     pub fn add_rule(&self, p: &AddRulePayload) -> Result<String> {
+        validate_fw_word("chain", &p.chain)?;
+        validate_fw_word("action", &p.action)?;
+        if let Some(ref v) = p.protocol { validate_fw_word("protocol", v)?; }
+        if let Some(ref v) = p.interface { validate_fw_word("interface", v)?; }
+        if let Some(ref v) = p.src_ip { validate_fw_ip(v)?; }
+        if let Some(ref v) = p.dst_ip { validate_fw_ip(v)?; }
         // Costruisce args come vettore di token: Command::args li passa intatti
         // al processo (no shell, no split su whitespace). I commenti con spazi
         // restano un singolo argomento.
@@ -73,6 +79,10 @@ impl FirewallManager {
     }
 
     pub fn remove_rule(&self, p: &RemoveRulePayload) -> Result<String> {
+        validate_fw_word("chain", &p.chain)?;
+        if let Some(ref v) = p.protocol { validate_fw_word("protocol", v)?; }
+        if let Some(ref v) = p.src_ip { validate_fw_ip(v)?; }
+        if let Some(ref v) = p.action { validate_fw_word("action", v)?; }
         if let Some(n) = p.rule_num {
             run_iptables(&["-D".to_string(), p.chain.clone(), n.to_string()])?;
             info!("Regola rimossa: -D {} {}", p.chain, n);
@@ -109,6 +119,7 @@ impl FirewallManager {
     }
 
     pub fn block_ip(&self, ip: &str, direction: &str) -> Result<String> {
+        validate_fw_ip(ip)?;
         match direction.to_uppercase().as_str() {
             "BOTH" => {
                 run_iptables(&["-A".to_string(), "INPUT".to_string(), "-s".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()])?;
@@ -129,6 +140,7 @@ impl FirewallManager {
     }
 
     pub fn unblock_ip(&self, ip: &str, direction: &str) -> Result<String> {
+        validate_fw_ip(ip)?;
         match direction.to_uppercase().as_str() {
             "BOTH" => {
                 let _ = run_iptables(&["-D".to_string(), "INPUT".to_string(), "-s".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()]);
@@ -177,6 +189,36 @@ impl FirewallManager {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Validazione dei token controllati dal server prima di passarli a iptables.
+// `Command::args` NON usa una shell, quindi non c'è command injection; ma un
+// valore che inizia con '-' verrebbe interpretato da iptables come un'opzione
+// (es. "-F" = flush dell'intera chain): argument injection. Si valida al
+// boundary — se un valore non è plausibile per il suo campo, si rifiuta la
+// regola invece di eseguire iptables con input inatteso. (ASVS V5/input.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Token "a parola": chain, protocollo, target `-j`, interfaccia. Alfanumerici,
+/// `_` e `-` interni; mai leading `-` (sarebbe letto come opzione di iptables).
+fn validate_fw_word(kind: &str, v: &str) -> Result<()> {
+    if v.is_empty() {
+        anyhow::bail!("{kind} vuoto");
+    }
+    if v.starts_with('-') || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        anyhow::bail!("{kind} non valido (atteso alfanumerico, no leading '-'): {v:?}");
+    }
+    Ok(())
+}
+
+/// IP o CIDR: cifre, esadecimali IPv6, `.`, `:`, `/`. Mai leading `-`.
+fn validate_fw_ip(v: &str) -> Result<()> {
+    if v.is_empty()
+        || v.starts_with('-')
+        || !v.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '/'))
+    {
+        anyhow::bail!("indirizzo IP/CIDR non valido: {v:?}");
+    }
+    Ok(())
+}
 
 /// Costruisce gli argomenti iptables in formato vettoriale. Command::args li
 /// passa intatti al processo (no shell, no quoting). I commenti con spazi
@@ -248,5 +290,38 @@ fn run_iptables(args: &[String]) -> Result<()> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_fw_ip, validate_fw_word};
+
+    #[test]
+    fn fw_word_accetta_valori_legittimi() {
+        for v in ["INPUT", "OUTPUT", "FORWARD", "tcp", "udp", "DROP", "ACCEPT", "eth0", "my-chain", "br_lan0"] {
+            assert!(validate_fw_word("campo", v).is_ok(), "{v} dovrebbe essere valido");
+        }
+    }
+
+    #[test]
+    fn fw_word_rifiuta_option_injection_e_metacaratteri() {
+        for v in ["-F", "-j", "", "DROP; rm", "a b", "a|b", "$(x)", "--flush"] {
+            assert!(validate_fw_word("campo", v).is_err(), "{v:?} doveva essere rifiutato");
+        }
+    }
+
+    #[test]
+    fn fw_ip_accetta_ip_e_cidr() {
+        for v in ["10.0.0.1", "192.168.1.0/24", "fe80::1", "::1", "2001:db8::/32"] {
+            assert!(validate_fw_ip(v).is_ok(), "{v} dovrebbe essere valido");
+        }
+    }
+
+    #[test]
+    fn fw_ip_rifiuta_option_like_e_metacaratteri() {
+        for v in ["-s", "", "1.2.3.4 -j DROP", "$(id)", "1.2.3.4;ls", "10.0.0.0/8 --flush"] {
+            assert!(validate_fw_ip(v).is_err(), "{v:?} doveva essere rifiutato");
+        }
     }
 }
