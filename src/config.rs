@@ -22,12 +22,21 @@ pub struct Config {
 pub struct AgentSettings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Certificato (PEM) della Root CA Dognet con cui sono firmati i certificati
+    /// dei master. Se impostato, l'agent verifica il certificato del server
+    /// contro questa CA su `wss://` (nessun MITM). Se assente, i certificati
+    /// self-signed sono accettati senza verifica, con un warning all'avvio
+    /// (comportamento legacy, solo LAN fidata).
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
             log_level: default_log_level(),
+            ca_cert: None,
         }
     }
 }

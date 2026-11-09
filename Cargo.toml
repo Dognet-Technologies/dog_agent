@@ -19,6 +19,9 @@ tokio-tungstenite = { version = "0.21", default-features = false, features = ["c
 # certificato. Versione allineata a quella risolta transitivamente da
 # tokio-tungstenite (vedi Cargo.lock), non introduce un secondo rustls.
 rustls = { version = "0.22", default-features = false, features = ["ring"] }
+# Carica il PEM della Root CA Dognet (agent.ca_cert) per la verifica stretta
+# del certificato server. Pura Rust, compatibile col build musl statico.
+rustls-pemfile = "2"
 futures-util = "0.3"
 
 # Serialization

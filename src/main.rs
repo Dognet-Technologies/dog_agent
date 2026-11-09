@@ -66,6 +66,10 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Inizializza la verifica TLS (Root CA Dognet se configurata, altrimenti
+    // verifier permissivo con warning). Una volta, prima di aprire connessioni.
+    ws::init_tls(config.agent.ca_cert.as_deref());
+
     // Avvia un task tokio per ogni target
     let mut handles = Vec::new();
     for mut target in config.targets {
