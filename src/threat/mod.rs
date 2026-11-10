@@ -80,7 +80,10 @@ impl ThreatDetector {
         let score_per_attempt = self.config.bruteforce_score_per_attempt;
         tokio::task::spawn_blocking(move || scan_auth_log_sync(min_attempts, score_per_attempt))
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                warn!("scan_auth_log: spawn_blocking panicato: {e}");
+                Vec::new()
+            })
     }
 
     #[cfg(target_os = "linux")]
@@ -89,7 +92,10 @@ impl ThreatDetector {
         let score_per_conn = self.config.synflood_score_per_conn;
         tokio::task::spawn_blocking(move || scan_connections_sync(min_connections, score_per_conn))
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                warn!("scan_port_connections: spawn_blocking panicato: {e}");
+                Vec::new()
+            })
     }
 
     fn block_ip(&self, ip: &str) -> anyhow::Result<()> {
@@ -232,12 +238,62 @@ fn extract_ip_from_log(line: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn parse_proc_ip(hex: &str) -> Option<String> {
     let parts: Vec<&str> = hex.splitn(2, ':').collect();
-    if parts.len() != 2 || parts[0].len() != 8 { return None; }
-    let n = u32::from_str_radix(parts[0], 16).ok()?;
-    let b = n.to_le_bytes();
-    Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+    if parts.len() != 2 { return None; }
+    match parts[0].len() {
+        // /proc/net/tcp: 8 char hex, un u32 little-endian.
+        8 => {
+            let n = u32::from_str_radix(parts[0], 16).ok()?;
+            let b = n.to_le_bytes();
+            Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+        }
+        // /proc/net/tcp6: 32 char hex — prima di questo fix ogni riga IPv6
+        // falliva qui silenziosamente, azzerando la detection SYN-flood su
+        // IPv6 senza alcun log (MEDIUM trovato in code review, 2026-11).
+        32 => parse_proc_ipv6(parts[0]),
+        _ => None,
+    }
+}
+
+/// `/proc/net/tcp6`: 4 parole da 32 bit, ciascuna in ordine little-endian
+/// (stessa convenzione del caso IPv4 sopra, applicata a ognuna delle 4
+/// parole che compongono l'indirizzo a 128 bit).
+#[cfg(target_os = "linux")]
+fn parse_proc_ipv6(hex: &str) -> Option<String> {
+    if hex.len() != 32 { return None; }
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(8).enumerate() {
+        let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    Some(std::net::Ipv6Addr::from(bytes).to_string())
 }
 
 fn is_valid_ip(s: &str) -> bool {
     s.split('.').count() == 4 && s.split('.').all(|p| p.parse::<u8>().is_ok())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod proc_ip_tests {
+    use super::parse_proc_ip;
+
+    #[test]
+    fn ipv4_formato_proc_net_tcp() {
+        // 0100007F:0050 = 127.0.0.1:80 (little-endian, come /proc/net/tcp)
+        assert_eq!(parse_proc_ip("0100007F:0050"), Some("127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn ipv6_formato_proc_net_tcp6_non_e_piu_scartato() {
+        // Regressione: prima del fix ogni riga di /proc/net/tcp6 falliva il
+        // parse (richiedeva esattamente 8 char hex) e veniva scartata in
+        // silenzio, azzerando la detection SYN-flood su IPv6.
+        // ::1 = 00000000000000000000000001000000
+        assert_eq!(parse_proc_ip("00000000000000000000000001000000:0050"), Some("::1".to_string()));
+    }
+
+    #[test]
+    fn formato_non_riconosciuto_torna_none_non_panica() {
+        assert_eq!(parse_proc_ip("ABC:0050"), None);
+        assert_eq!(parse_proc_ip("senza-due-punti"), None);
+    }
 }
