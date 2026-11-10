@@ -29,7 +29,16 @@ pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
         return unavailable("python3 non disponibile sul target".to_string());
     }
 
-    let out_path = format!("/tmp/security-audit-{}.json", std::process::id());
+    // Il pid di processo da solo NON basta: è lo stesso per TUTTA la vita
+    // del processo, non per-call — con due target configurati su questo
+    // stesso agent, due security_audit_scan concorrenti condividerebbero lo
+    // stesso path, leggendo/cancellando il file l'uno dell'altro (HIGH
+    // trovato in code review, 2026-11). Un contatore atomico per-call,
+    // come già fa `run_shell::SHELL_SEQ` per lo stesso identico motivo,
+    // rende il path univoco per ogni esecuzione.
+    static AUDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = AUDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out_path = format!("/tmp/security-audit-{}-{}.json", std::process::id(), seq);
     let cmd = format!(
         "python3 {} -m {} -f JSON -o {} -q --no-cache",
         AUDIT_SCRIPT,
@@ -37,9 +46,19 @@ pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
         shell_quote(&out_path)
     );
 
-    let (code, _output, timed_out) = super::hardening::run_shell(&cmd, AUDIT_TIMEOUT_SECS);
+    let (code, output, timed_out) = super::hardening::run_shell(&cmd, AUDIT_TIMEOUT_SECS);
     if timed_out {
         return failed("timeout durante l'esecuzione del security audit".to_string());
+    }
+    // Un exit non-zero non deve far fidare del file di output: potrebbe
+    // essere assente, parziale o una vecchia scansione mai pulita — prima
+    // di questo fix il codice di uscita non veniva controllato affatto.
+    if code != 0 {
+        let _ = std::fs::remove_file(&out_path);
+        return failed(format!(
+            "script terminato con exit {code}: {}",
+            output.lines().last().unwrap_or("(nessun output)")
+        ));
     }
 
     let raw = match std::fs::read_to_string(&out_path) {
