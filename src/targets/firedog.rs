@@ -241,8 +241,32 @@ where
         }
         ServerMessage::Command { command_id, action, payload } => {
             info!("[{}] Comando ricevuto: {:?}", config.name, action);
-            let (status, output, error) =
-                execute_command(config, fw, &command_id, action, payload).await;
+            // Tetto assoluto sull'intero dispatch: un comando che si blocca
+            // (es. check_integrity su un path enorme/non terminante) non
+            // deve più bloccare per sempre questa sessione — niente più
+            // heartbeat/threat-report/reconnect per il target finché il
+            // processo non viene ucciso a mano (HIGH trovato in code
+            // review, 2026-11).
+            const COMMAND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(90);
+            let (status, output, error) = match tokio::time::timeout(
+                COMMAND_DISPATCH_TIMEOUT,
+                execute_command(config, fw, &command_id, action, payload),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    error!(
+                        "[{}] Comando {} oltre il timeout di {:?}, abortito",
+                        config.name, command_id, COMMAND_DISPATCH_TIMEOUT
+                    );
+                    (
+                        CommandStatus::Failed,
+                        None,
+                        Some(format!("timeout dispatch dopo {COMMAND_DISPATCH_TIMEOUT:?}")),
+                    )
+                }
+            };
 
             let resp = AgentMessage::CommandResponse {
                 command_id,
@@ -304,10 +328,15 @@ async fn execute_command(
             fw.sync_rules()
         }
         CommandAction::CheckIntegrity => {
-            let paths = match serde_json::from_value::<CheckIntegrityPayload>(payload) {
-                Ok(p) => p.paths.unwrap_or_else(|| config.integrity_paths.clone()),
-                Err(_) => config.integrity_paths.clone(),
-            };
+            // `paths` richiesti dal server sono SOLO un filtro, non possono
+            // ampliare l'insieme configurato localmente in integrity_paths:
+            // altrimenti il server potrebbe usare questo comando come
+            // oracolo di lettura (hash/size/mtime) su qualunque file del
+            // filesystem (CRITICAL trovato in code review, 2026-11).
+            let requested = serde_json::from_value::<CheckIntegrityPayload>(payload)
+                .ok()
+                .and_then(|p| p.paths);
+            let paths = filter_integrity_paths(requested, &config.integrity_paths);
             run_integrity_check(&paths).await
         }
         CommandAction::UpdateConfig => {
@@ -333,6 +362,25 @@ async fn execute_command(
             error!("[{}] Comando {} fallito: {}", config.name, command_id, e);
             (CommandStatus::Failed, None, Some(e.to_string()))
         }
+    }
+}
+
+/// `requested` (dal server, via `CheckIntegrityPayload.paths`) è SOLO un
+/// filtro sull'insieme configurato localmente in `integrity_paths` — non può
+/// mai ampliarlo. Senza questo, il server potrebbe usare `check_integrity`
+/// come oracolo di lettura (hash/size/mtime) su qualunque file del
+/// filesystem (CRITICAL trovato in code review, 2026-11).
+fn filter_integrity_paths(requested: Option<Vec<String>>, configured: &[String]) -> Vec<String> {
+    match requested {
+        None => configured.to_vec(),
+        Some(requested) => requested
+            .into_iter()
+            .filter(|r| {
+                configured
+                    .iter()
+                    .any(|allowed| r == allowed || r.starts_with(&format!("{allowed}/")))
+            })
+            .collect(),
     }
 }
 
@@ -458,22 +506,30 @@ fn update_target_config_file(
         anyhow::anyhow!("Blocco [[targets]] '{}' non trovato in {}", target_name, path.display())
     })?;
 
-    let mut remaining: Vec<&str> = updates.iter().map(|(k, _)| *k).collect();
+    // `matched` è popolato controllando `updates` direttamente (non una
+    // lista derivata separata che potrebbe divergere): un `.unwrap()` qui
+    // dipendeva da un invariante non documentato tra due liste — una
+    // futura modifica indipendente dell'una o dell'altra lo avrebbe reso
+    // un panic raggiungibile da un messaggio del server (HIGH trovato in
+    // code review, 2026-11; vedi anche la mancanza di supervisione sui
+    // panic dei target, corretta separatamente in targets/mod.rs).
+    let mut matched: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for line in &mut lines[block_start..block_end] {
         let trimmed = line.trim_start().to_string();
         for (key, value) in updates {
             if let Some(rest) = trimmed.strip_prefix(key) {
                 if rest.trim_start().starts_with('=') {
                     *line = format!("{key} = {value}");
-                    remaining.retain(|k| k != key);
+                    matched.insert(key);
                 }
             }
         }
     }
-    for key in remaining {
-        let value = &updates.iter().find(|(k, _)| *k == key).unwrap().1;
-        lines.insert(block_end, format!("{key} = {value}"));
-        block_end += 1;
+    for (key, value) in updates {
+        if !matched.contains(key) {
+            lines.insert(block_end, format!("{key} = {value}"));
+            block_end += 1;
+        }
     }
 
     std::fs::write(path, lines.join("\n") + "\n")
@@ -678,4 +734,97 @@ where
     info!("[{}] firewall_stats inviato (snapshot mtime={:?})", config.name, mtime);
     *last_mtime = Some(mtime);
     Ok(())
+}
+
+#[cfg(test)]
+mod update_target_config_file_tests {
+    use super::update_target_config_file;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_toml(content: &str) -> std::path::PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "dog-agent-test-config-{}-{}.toml",
+            std::process::id(),
+            seq
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn aggiorna_chiave_esistente_e_aggiunge_chiave_assente() {
+        let path = tmp_toml(
+            "[[targets]]\nname = \"t1\"\nthreat_threshold = 75\n[[targets]]\nname = \"t2\"\n",
+        );
+        let updates = vec![
+            ("threat_threshold", "90".to_string()),
+            ("bruteforce_min_attempts", "12".to_string()),
+        ];
+        update_target_config_file(&path, "t1", &updates).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(out.contains("threat_threshold = 90"));
+        assert!(out.contains("bruteforce_min_attempts = 12"));
+        // Il blocco del secondo target non deve essere toccato.
+        assert!(out.contains("name = \"t2\""));
+        // La nuova chiave va aggiunta DENTRO il blocco di t1, non dopo t2.
+        let t1_pos = out.find("name = \"t1\"").unwrap();
+        let t2_pos = out.find("name = \"t2\"").unwrap();
+        let new_key_pos = out.find("bruteforce_min_attempts").unwrap();
+        assert!(t1_pos < new_key_pos && new_key_pos < t2_pos);
+    }
+
+    #[test]
+    fn blocco_non_trovato_e_un_errore_non_un_panic() {
+        let path = tmp_toml("[[targets]]\nname = \"t1\"\n");
+        let err = update_target_config_file(&path, "non-esiste", &[("x", "1".to_string())])
+            .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains("non trovato"));
+    }
+}
+
+#[cfg(test)]
+mod filter_integrity_paths_tests {
+    use super::filter_integrity_paths;
+
+    #[test]
+    fn nessuna_richiesta_usa_tutto_il_configurato() {
+        let configured = vec!["/etc".to_string(), "/usr/bin".to_string()];
+        assert_eq!(filter_integrity_paths(None, &configured), configured);
+    }
+
+    #[test]
+    fn richiesta_fuori_dal_configurato_e_scartata() {
+        // Regressione: il server non deve poter usare check_integrity come
+        // oracolo di lettura su un path arbitrario fuori da quanto già
+        // configurato localmente (es. /root/.ssh, o /dev/zero per un DoS).
+        // Un sottopercorso di una root GIA' configurata (es. /etc/shadow
+        // quando /etc è in integrity_paths) non è invece una nuova
+        // esposizione: una scan illimitata di /etc lo includerebbe comunque
+        // già oggi — è il comportamento normale del file-integrity-monitoring.
+        let configured = vec!["/etc".to_string()];
+        let requested = vec!["/etc/ssh".to_string(), "/root/.ssh".to_string(), "/dev/zero".to_string()];
+        let out = filter_integrity_paths(Some(requested), &configured);
+        assert_eq!(out, vec!["/etc/ssh".to_string()]);
+    }
+
+    #[test]
+    fn richiesta_esattamente_uguale_a_un_path_configurato_e_accettata() {
+        let configured = vec!["/usr/bin".to_string()];
+        let out = filter_integrity_paths(Some(vec!["/usr/bin".to_string()]), &configured);
+        assert_eq!(out, vec!["/usr/bin".to_string()]);
+    }
+
+    #[test]
+    fn prefisso_senza_separatore_non_basta() {
+        // "/etcfoo" non è un sottopercorso di "/etc".
+        let configured = vec!["/etc".to_string()];
+        let out = filter_integrity_paths(Some(vec!["/etcfoo".to_string()]), &configured);
+        assert!(out.is_empty());
+    }
 }

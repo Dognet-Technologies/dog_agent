@@ -85,8 +85,22 @@ fn hash_paths(paths: &[String]) -> Result<Vec<FileHash>> {
     Ok(hashes)
 }
 
+/// Cap di dimensione prima di leggere un file interamente in memoria per
+/// l'hash — senza questo, un path puntato su un file enorme (o un
+/// "file" speciale che non termina mai la lettura) poteva bloccare/esaurire
+/// la memoria del thread bloccante (HIGH trovato in code review, 2026-11).
+const MAX_HASH_FILE_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
 fn hash_file(path: &Path) -> Result<FileHash> {
     let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_HASH_FILE_SIZE_BYTES {
+        anyhow::bail!(
+            "file {} troppo grande per l'hash ({} byte > {} byte)",
+            path.display(),
+            meta.len(),
+            MAX_HASH_FILE_SIZE_BYTES
+        );
+    }
     let data = std::fs::read(path)?;
 
     let mut hasher = Sha512::new();
