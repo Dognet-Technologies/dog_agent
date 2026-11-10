@@ -25,11 +25,19 @@ pub struct AgentSettings {
 
     /// Certificato (PEM) della Root CA Dognet con cui sono firmati i certificati
     /// dei master. Se impostato, l'agent verifica il certificato del server
-    /// contro questa CA su `wss://` (nessun MITM). Se assente, i certificati
-    /// self-signed sono accettati senza verifica, con un warning all'avvio
-    /// (comportamento legacy, solo LAN fidata).
+    /// contro questa CA su `wss://` (nessun MITM). Se assente, l'agent si
+    /// rifiuta di avviarsi su un target `wss://` — vedi `allow_insecure_tls`.
     #[serde(default)]
     pub ca_cert: Option<PathBuf>,
+
+    /// Opt-in esplicito per accettare certificati server self-signed SENZA
+    /// verificarli contro una CA (nessuna protezione da MITM attivo su
+    /// `wss://`). Default `false`: senza `ca_cert` e senza questo flag,
+    /// l'agent si rifiuta di avviarsi invece di ricadere silenziosamente su
+    /// una connessione non verificata. Da usare solo in LAN fidata, come
+    /// misura transitoria prima di configurare una vera CA.
+    #[serde(default)]
+    pub allow_insecure_tls: bool,
 }
 
 impl Default for AgentSettings {
@@ -37,6 +45,7 @@ impl Default for AgentSettings {
         Self {
             log_level: default_log_level(),
             ca_cert: None,
+            allow_insecure_tls: false,
         }
     }
 }
@@ -383,6 +392,18 @@ impl Config {
         for target in &self.targets {
             target.validate()?;
         }
+        if self.agent.ca_cert.is_none() && !self.agent.allow_insecure_tls {
+            if let Some(target) = self.targets.iter().find(|t| t.ws_url().starts_with("wss://")) {
+                anyhow::bail!(
+                    "Target '{}': endpoint wss:// senza [agent] ca_cert configurato. \
+                     Imposta [agent] ca_cert = \"/path/to/ca.pem\" per verificare il \
+                     certificato del server, oppure [agent] allow_insecure_tls = true per \
+                     accettare certificati self-signed senza verifica (SOLO in LAN fidata, \
+                     nessuna protezione da MITM attivo).",
+                    target.name
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -464,5 +485,53 @@ mod cybershepherd_validate_tests {
         assert!(target("").validate().is_err());
         // Identità parziale (manca mac) non basta neppure lei.
         assert!(target("ip = \"10.10.0.18\"\nhostname = \"h\"").validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod tls_validate_tests {
+    use super::Config;
+
+    fn config(agent_extra: &str, url: &str) -> Config {
+        toml::from_str(&format!(
+            "[agent]\n{agent_extra}\n[[targets]]\nname = \"t\"\nsystem_type = \"firedog\"\nurl = \"{url}\"\napi_key = \"k\"\nip = \"10.0.0.1\"\nhostname = \"h\"\nmac = \"aa:bb:cc:dd:ee:ff\"\n"
+        ))
+        .expect("toml valido")
+    }
+
+    // Regressione: senza ca_cert e senza allow_insecure_tls, un target wss://
+    // non deve più ricadere silenziosamente su una connessione TLS non
+    // verificata (CRITICAL trovato in code review, 2026-11).
+    #[test]
+    fn wss_senza_ca_cert_ne_opt_in_e_rifiutato() {
+        let err = config("", "wss://master.example.com").validate().unwrap_err();
+        assert!(err.to_string().contains("ca_cert"));
+    }
+
+    #[test]
+    fn wss_con_ca_cert_e_accettato_anche_se_il_file_non_esiste_ancora() {
+        // validate() controlla solo che ca_cert sia CONFIGURATO, non che il
+        // file esista già: la lettura/parsing del PEM avviene dopo, in
+        // ws::init_tls, con un errore dedicato se il file manca o è invalido.
+        config(
+            "ca_cert = \"/etc/dog-agent/dognet-ca.pem\"",
+            "wss://master.example.com",
+        )
+        .validate()
+        .expect("ca_cert configurato basta a passare la validazione");
+    }
+
+    #[test]
+    fn wss_con_allow_insecure_tls_e_accettato() {
+        config("allow_insecure_tls = true", "wss://master.example.com")
+            .validate()
+            .expect("allow_insecure_tls=true è un opt-in valido");
+    }
+
+    #[test]
+    fn ws_in_chiaro_non_richiede_ca_cert_ne_opt_in() {
+        config("", "ws://master.example.com")
+            .validate()
+            .expect("ws:// non usa TLS, nessun vincolo su ca_cert");
     }
 }

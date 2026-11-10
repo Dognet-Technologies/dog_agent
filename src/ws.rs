@@ -3,10 +3,13 @@
 /// - **con CA configurata** (Root CA Dognet): il certificato del server è
 ///   verificato contro quella CA — un MITM che presenti un certificato non
 ///   firmato dalla CA viene rifiutato. È la modalità consigliata.
-/// - **senza CA** (legacy): accetta qualunque certificato (self-signed),
-///   proteggendo solo da chi origlia passivamente, non da un attacker attivo.
-///   All'avvio `init_tls` logga un warning. Prima di tutto questo il traffico
-///   agent — api_key, heartbeat, threat log — viaggiava in chiaro su `ws://`.
+/// - **senza CA**: `Config::validate` (src/config.rs) impedisce all'agent di
+///   avviarsi su un target `wss://`, A MENO che `agent.allow_insecure_tls` non
+///   sia impostato esplicitamente a `true` — in quel caso si ricade sul
+///   verifier permissivo sotto, che accetta qualunque certificato
+///   self-signed e protegge solo da chi origlia passivamente, non da un
+///   attacker attivo. Non è più un default silenzioso: è un opt-in
+///   deliberato e documentato in config.example.toml.
 use anyhow::Result;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -110,9 +113,14 @@ pub fn init_tls(ca_cert: Option<&Path>) {
             }
         },
         None => {
+            // Config::validate (src/config.rs) rifiuta già l'avvio su un
+            // target wss:// senza ca_cert A MENO che allow_insecure_tls non
+            // sia stato impostato esplicitamente — se arriviamo qui con un
+            // target wss:// è perché quell'opt-in è attivo.
             warn!(
-                "TLS: nessun agent.ca_cert configurato — i certificati self-signed sono accettati \
-                 senza verifica (MITM possibile su wss://). Configura agent.ca_cert per la verifica."
+                "TLS: agent.allow_insecure_tls è attivo — i certificati self-signed sono \
+                 accettati senza verifica (MITM possibile su wss://). Configura agent.ca_cert \
+                 per la verifica stretta."
             );
             insecure_config()
         }
