@@ -250,9 +250,16 @@ fn record_backup(backups: &mut Vec<Value>, path: &str) {
 fn apply_owner_mode(path: &str, task: &Value) -> Result<(), String> {
     if let Some(mode) = s(task, "mode") {
         // Modalità ottale tipo "0644"/"0750"; from_str_radix gestisce lo zero iniziale.
-        if let Ok(m) = u32::from_str_radix(mode.trim().trim_start_matches("0o"), 8) {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(m));
-        }
+        // Prima di questo fix un mode malformato o un set_permissions
+        // fallito (disco pieno, path read-only) venivano scartati in
+        // silenzio: il controllo veniva comunque registrato come "ok" e
+        // riportato al server come conforme (MEDIUM trovato in code
+        // review, 2026-11) — a differenza del ramo chown poco sotto, che
+        // già propagava correttamente i propri errori.
+        let m = u32::from_str_radix(mode.trim().trim_start_matches("0o"), 8)
+            .map_err(|e| format!("mode '{mode}' non valido: {e}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m))
+            .map_err(|e| format!("set_permissions {path} (mode {mode}): {e}"))?;
     }
     if let Some(owner) = s(task, "owner") {
         // chown user[:group]
@@ -263,9 +270,30 @@ fn apply_owner_mode(path: &str, task: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Path che la DSL di hardening non deve mai poter scrivere, indipendentemente
+/// da cosa richieda un template — anche uno curato può contenere un errore, e
+/// un template arrivato tramite un canale di pairing/autorizzazione
+/// compromesso non deve poter alterare credenziali/privilegi direttamente
+/// scrivendo su questi file. Il vero controllo di autorizzazione su CHI può
+/// inviare un comando `execute_hardening`/`apply_remediation` vive a monte
+/// (nel master): questo è un secondo strato di difesa, non l'unico.
+fn is_protected_path(path: &str) -> bool {
+    const DENYLIST_EXACT: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/sudoers"];
+    if DENYLIST_EXACT.contains(&path) {
+        return true;
+    }
+    if path.starts_with("/etc/sudoers.d/") {
+        return true;
+    }
+    path.ends_with("/authorized_keys") || path.ends_with("/authorized_keys2")
+}
+
 fn act_file_content(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "file").ok_or("file mancante")?;
     let content = s(task, "content").ok_or("content mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
     if dry { return Ok(format!("scriverebbe {} ({} byte)", file, content.len())); }
     if let Some(parent) = std::path::Path::new(file).parent() { let _ = std::fs::create_dir_all(parent); }
     record_backup(backups, file);
@@ -277,6 +305,9 @@ fn act_file_content(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result
 fn act_file_copy(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let src = s(task, "src").ok_or("src mancante")?;
     let dest = s(task, "dest").ok_or("dest mancante")?;
+    if is_protected_path(dest) {
+        return Err(format!("path protetto, scrittura rifiutata: {dest}"));
+    }
     if dry { return Ok(format!("copierebbe {src} → {dest}")); }
     if !std::path::Path::new(src).exists() {
         return Err(format!("src {src} non presente sul target"));
@@ -300,6 +331,9 @@ fn act_file_copy(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<St
 ///   aggiunto (ignorata se non si aggiunge nulla, es. tutto già presente).
 fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "file").ok_or("file mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
 
     // Ogni entry porta la propria riga + una posizione OPZIONALE
     // (Some(true)="before", Some(false)="after") che sovrascrive quella
@@ -419,6 +453,9 @@ fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> R
 
 fn act_file_line_replace(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "file").ok_or("file mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
     let search = s(task, "search").ok_or("search mancante")?;
     let replace = s(task, "replace").unwrap_or("");
     let create_if_missing = task.get("create_if_missing").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -447,6 +484,9 @@ fn act_file_section_update(task: &Value, dry: bool, backups: &mut Vec<Value>) ->
     // sia presente nel file; se assente lo appende. Idempotente sul blocco.
     let file = s(task, "file").ok_or("file mancante")?;
     let content = s(task, "content").ok_or("content mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
     let existing = std::fs::read_to_string(file).unwrap_or_default();
     if existing.contains(content.trim()) {
         return Ok(format!("sezione già presente in {file}"));
@@ -473,7 +513,11 @@ fn act_sysctl(task: &Value, dry: bool) -> Result<String, String> {
         let mut new = existing;
         if !new.is_empty() && !new.ends_with('\n') { new.push('\n'); }
         new.push_str(&line); new.push('\n');
-        let _ = std::fs::write(&conf, new);
+        // Prima di questo fix un fallimento qui (disco pieno, /etc/sysctl.d
+        // read-only) veniva scartato in silenzio: il valore runtime poteva
+        // applicarsi ma non sopravvivere a un reboot, senza che nulla lo
+        // segnalasse (MEDIUM trovato in code review, 2026-11).
+        std::fs::write(&conf, new).map_err(|e| format!("scrittura {conf}: {e}"))?;
     }
     let status = Command::new("sysctl").arg("-w").arg(format!("{param}={value}")).status()
         .map_err(|e| format!("sysctl: {e}"))?;
@@ -530,6 +574,9 @@ fn act_package_install(task: &Value, dry: bool) -> Result<String, String> {
 fn act_cron(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
     let file = s(task, "cron_file").ok_or("cron_file mancante")?;
     let entry = s(task, "entry").ok_or("entry mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
     if dry { return Ok(format!("scriverebbe cron {file}")); }
     record_backup(backups, file);
     let mut body = String::from("# CyberShepherd hardening\n");
@@ -567,6 +614,10 @@ fn act_fstab(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String
 
 fn act_command(task: &Value, dry: bool) -> Result<String, String> {
     let cmd = s(task, "command").ok_or("command mancante")?;
+    // Audit trail LOCALE (journalctl), indipendente da cosa arriva al master
+    // nell'execution_log: resta una traccia forense anche se quel report
+    // viene perso o manomesso lungo il canale di pairing.
+    info!(dry, command = %cmd, "hardening: comando da eseguire (audit trail locale)");
     let expected = task.get("expected_exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
     if dry { return Ok(format!("eseguirebbe: {}", first_line(cmd))); }
     let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
@@ -582,6 +633,8 @@ fn act_command(task: &Value, dry: bool) -> Result<String, String> {
 
 fn act_script(task: &Value, dry: bool) -> Result<String, String> {
     let script = s(task, "script").ok_or("script mancante")?;
+    // Audit trail locale — vedi commento in act_command.
+    info!(dry, script = %script, "hardening: script da eseguire (audit trail locale)");
     if dry { return Ok(format!("eseguirebbe script ({} righe)", script.lines().count())); }
     let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
     let (code, out, timed_out) = run_shell(script, secs);
@@ -873,6 +926,36 @@ mod tests {
         let msg = act_script(&task, false).unwrap();
         assert_eq!(msg, "script ok");
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "ciao");
+    }
+
+    #[test]
+    fn is_protected_path_rifiuta_file_credenziali_e_accetta_config_normali() {
+        for p in [
+            "/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/sudoers",
+            "/etc/sudoers.d/90-cloud-init-users",
+            "/root/.ssh/authorized_keys", "/home/user/.ssh/authorized_keys",
+        ] {
+            assert!(is_protected_path(p), "{p} doveva essere protetto");
+        }
+        for p in ["/etc/ssh/sshd_config", "/etc/login.defs", "/etc/sysctl.d/99-x.conf", "/boot/grub/grub.cfg"] {
+            assert!(!is_protected_path(p), "{p} non doveva essere protetto");
+        }
+    }
+
+    #[test]
+    fn act_file_content_rifiuta_path_protetti() {
+        let task = json!({ "file": "/etc/shadow", "content": "x" });
+        let mut backups = Vec::new();
+        let err = act_file_content(&task, false, &mut backups).unwrap_err();
+        assert!(err.contains("protetto"));
+    }
+
+    #[test]
+    fn act_file_line_present_rifiuta_path_protetti_anche_in_dry_run() {
+        let task = json!({ "file": "/etc/sudoers.d/evil", "line": "ALL ALL=(ALL) NOPASSWD: ALL" });
+        let mut backups = Vec::new();
+        let err = act_file_line_present(&task, true, &mut backups).unwrap_err();
+        assert!(err.contains("protetto"));
     }
 
     #[test]
