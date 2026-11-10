@@ -91,7 +91,15 @@ async fn session(config: &TargetConfig) -> Result<()> {
     // stava contemporaneamente pollando il read half: le risposte out-of-band
     // (es. esito hardening) restavano in coda per decine di secondi. Un task
     // dedicato che possiede il sink e lo polla di continuo elimina il ritardo.
-    let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    //
+    // Canale CON bound (256): se la connessione si blocca (rete lenta,
+    // server fermo/MITM) la coda non deve crescere senza limite in memoria
+    // — un `try_send` che fallisce quando piena è preferibile a un OOM
+    // dell'agent (MEDIUM trovato in code review, 2026-11). 256 è
+    // abbondante per il traffico normale (metriche ogni send_interval,
+    // progress di hardening uno per controllo) senza scartare messaggi
+    // legittimi durante un rallentamento transitorio.
+    let (out, mut out_rx) = tokio::sync::mpsc::channel::<Message>(256);
     tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if ws_tx.send(m).await.is_err() {
@@ -156,7 +164,7 @@ async fn session(config: &TargetConfig) -> Result<()> {
                         handle_server_message(config, &out, &text, target_id).await?;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        out.send(Message::Pong(data)).map_err(|e| anyhow::anyhow!("channel: {e}"))?;
+                        out.try_send(Message::Pong(data)).map_err(|e| anyhow::anyhow!("channel: {e}"))?;
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("[{}] Server ha chiuso la connessione", config.name);
@@ -261,7 +269,7 @@ where
 
 fn flush_buffer(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     buffer: &mut Vec<AllMetrics>,
     target_id: i32,
 ) -> Result<()> {
@@ -282,7 +290,7 @@ fn flush_buffer(
         payload: compressed,
     };
 
-    out.send(Message::Text(serde_json::to_string(&msg)?))
+    out.try_send(Message::Text(serde_json::to_string(&msg)?))
         .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
     buffer.clear();
     Ok(())
@@ -291,7 +299,7 @@ fn flush_buffer(
 /// Comprime e invia un batch di eventi Laurel come `SecurityEvents`.
 fn flush_security_events(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     events: Vec<serde_json::Value>,
     target_id: i32,
 ) -> Result<()> {
@@ -311,7 +319,7 @@ fn flush_security_events(
         timestamp: chrono::Utc::now().timestamp(),
         payload: compressed,
     };
-    out.send(Message::Text(serde_json::to_string(&msg)?))
+    out.try_send(Message::Text(serde_json::to_string(&msg)?))
         .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
     Ok(())
 }
@@ -355,7 +363,7 @@ fn read_laurel_events(path: &str, offset: u64) -> (Vec<serde_json::Value>, u64) 
 
 async fn handle_server_message(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     text: &str,
     target_id: i32,
 ) -> Result<()> {
@@ -401,7 +409,7 @@ async fn handle_server_message(
                         error,
                     },
                 };
-                out.send(Message::Text(serde_json::to_string(&resp)?))
+                out.try_send(Message::Text(serde_json::to_string(&resp)?))
                     .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
             }
         }
@@ -421,7 +429,7 @@ async fn handle_server_message(
 /// L'esecuzione vera è bloccante → gira in spawn_blocking.
 async fn run_hardening_command(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     target_id: i32,
     params: &serde_json::Value,
 ) -> Result<()> {
@@ -466,8 +474,22 @@ async fn run_hardening_command(
             let _ = ptx.send(u);
         })
     });
+    // Non usare `?` dentro questo loop: un fallimento nell'INVIO di un
+    // progress update (sessione/writer già morti) non deve più far
+    // ritornare la funzione PRIMA di aver atteso `handle` — altrimenti
+    // l'esecuzione bloccante (che sta mutando file/systemctl sul sistema
+    // reale) resta orfana, detached, mai letta né riportata, e un
+    // reconnect potrebbe far ripartire lo stesso comando mentre quella
+    // vecchia esecuzione gira ancora in parallelo (HIGH trovato in code
+    // review, 2026-11). Un fallimento d'invio smette solo di provare a
+    // mandare ALTRI progress update, ma continua a drenare il canale e
+    // attende comunque l'esito finale.
+    let mut send_failed = false;
     while let Some(u) = prx.recv().await {
-        send_hardening_status(
+        if send_failed {
+            continue;
+        }
+        if let Err(e) = send_hardening_status(
             out, target_id, exec_id, "running",
             Some(serde_json::json!({
                 "total_controls": u.total,
@@ -477,7 +499,13 @@ async fn run_hardening_command(
                 "execution_log": u.log,
             })),
             None,
-        )?;
+        ) {
+            warn!(
+                "[{}] Hardening exec {}: invio progress fallito ({}), continuo ad attendere l'esecuzione",
+                config.name, exec_id, e
+            );
+            send_failed = true;
+        }
     }
     let outcome = handle.await.map_err(|e| anyhow::anyhow!("join hardening: {e}"))?;
 
@@ -490,7 +518,16 @@ async fn run_hardening_command(
         "rollback_data": outcome.rollback_data,
         "control_results": outcome.control_results,
     });
-    send_hardening_status(out, target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref())?;
+    if let Err(e) = send_hardening_status(out, target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref()) {
+        // L'esecuzione È andata avanti e ha davvero mutato il sistema: se
+        // anche l'invio dell'esito finale fallisce, l'unica traccia che
+        // resta è questo log locale — meglio di perderla silenziosamente.
+        error!(
+            "[{}] Hardening exec {} completato ({}/{} controlli ok, {} falliti, stato={}) ma l'esito NON è stato riportato al server ({}): modifiche al sistema potrebbero non essere registrate lato master",
+            config.name, exec_id, outcome.successful_controls, outcome.total_controls, outcome.failed_controls, outcome.status, e
+        );
+        return Err(e);
+    }
     info!("[{}] Hardening exec {} → {}", config.name, exec_id, outcome.status);
     Ok(())
 }
@@ -502,7 +539,7 @@ async fn run_hardening_command(
 /// di risposta allo stesso modo già usato per l'hardening).
 async fn run_security_audit_command(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     target_id: i32,
     params: &serde_json::Value,
 ) -> Result<()> {
@@ -535,7 +572,7 @@ async fn run_security_audit_command(
             "error": outcome.error,
         }
     });
-    out.send(Message::Text(msg.to_string()))
+    out.try_send(Message::Text(msg.to_string()))
         .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
 
     info!("[{}] Security audit exec {} → {}", config.name, exec_id, outcome.status);
@@ -549,7 +586,7 @@ async fn run_security_audit_command(
 /// per il dispatch dual-shape lato server.
 async fn run_apply_remediation_command(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     target_id: i32,
     params: &serde_json::Value,
 ) -> Result<()> {
@@ -577,7 +614,7 @@ async fn run_apply_remediation_command(
             "error": outcome.error,
         }
     });
-    out.send(Message::Text(msg.to_string()))
+    out.try_send(Message::Text(msg.to_string()))
         .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
 
     info!("[{}] Apply remediation {} → {}", config.name, apply_id, status);
@@ -585,7 +622,7 @@ async fn run_apply_remediation_command(
 }
 
 fn send_hardening_status(
-    out: &tokio::sync::mpsc::UnboundedSender<Message>,
+    out: &tokio::sync::mpsc::Sender<Message>,
     target_id: i32,
     execution_id: i64,
     status: &str,
@@ -604,7 +641,7 @@ fn send_hardening_status(
         }
     });
     // Inviato via canale al writer task dedicato (flush affidabile e immediato).
-    out.send(Message::Text(msg.to_string()))
+    out.try_send(Message::Text(msg.to_string()))
         .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
     Ok(())
 }
