@@ -39,12 +39,23 @@ impl FirewallManager {
         }
     }
 
+    /// Un panic DENTRO una delle sezioni critiche sotto (push/retain/len,
+    /// improbabile ma non impossibile) avvelenerebbe il Mutex per il resto
+    /// della vita di questo `FirewallManager`: senza recupero, ogni
+    /// operazione firewall successiva su questo target panicherebbe a sua
+    /// volta per sempre (MEDIUM trovato in code review, 2026-11 — si
+    /// somma al fix di supervisione/restart in targets/mod.rs, ma qui è
+    /// evitabile a monte).
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, FwState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn active_rules_count(&self) -> u32 {
-        self.state.lock().unwrap().active_rules.len() as u32
+        self.lock_state().active_rules.len() as u32
     }
 
     pub fn blocked_ips_count(&self) -> u32 {
-        self.state.lock().unwrap().blocked_ips.len() as u32
+        self.lock_state().blocked_ips.len() as u32
     }
 
     // ── Comandi pubblici ──────────────────────────────────────────────────────
@@ -69,7 +80,7 @@ impl FirewallManager {
             .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
             .collect::<Vec<_>>()
             .join(" ");
-        self.state.lock().unwrap().active_rules.push(RuleRecord {
+        self.lock_state().active_rules.push(RuleRecord {
             chain: p.chain.clone(),
             rule_spec: pretty.clone(),
         });
@@ -134,29 +145,52 @@ impl FirewallManager {
             }
         }
 
-        self.state.lock().unwrap().blocked_ips.push(ip.to_string());
+        self.lock_state().blocked_ips.push(ip.to_string());
         info!("IP bloccato: {} ({})", ip, direction);
         Ok(format!("IP {ip} bloccato ({direction})"))
     }
 
     pub fn unblock_ip(&self, ip: &str, direction: &str) -> Result<String> {
         validate_fw_ip(ip)?;
-        match direction.to_uppercase().as_str() {
-            "BOTH" => {
-                let _ = run_iptables(&["-D".to_string(), "INPUT".to_string(), "-s".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()]);
-                let _ = run_iptables(&["-D".to_string(), "OUTPUT".to_string(), "-d".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()]);
-            }
-            "OUTPUT" => {
-                let _ = run_iptables(&["-D".to_string(), "OUTPUT".to_string(), "-d".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()]);
-            }
-            _ => {
-                let _ = run_iptables(&["-D".to_string(), "INPUT".to_string(), "-s".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()]);
+        // "BOTH" tenta la rimozione in entrambe le direzioni best-effort
+        // (non si sa sempre quale fosse stata usata al momento del blocco,
+        // e un retry idempotente su una regola già assente non deve essere
+        // un errore fatale) — ma a differenza di prima, ogni fallimento è
+        // loggato e, se TUTTI i tentativi applicabili falliscono, la
+        // funzione ritorna un errore reale invece di affermare sempre
+        // "sbloccato" (CRITICAL trovato in code review, 2026-11: con
+        // iptables assente/permessi insufficienti/regola non trovata per
+        // un motivo reale, il comando "unblock" tornava Success comunque,
+        // lasciando l'IP ancora droppato senza alcuna traccia d'errore).
+        let specs: Vec<Vec<String>> = match direction.to_uppercase().as_str() {
+            "BOTH" => vec![
+                vec!["-D".into(), "INPUT".into(), "-s".into(), ip.into(), "-j".into(), "DROP".into()],
+                vec!["-D".into(), "OUTPUT".into(), "-d".into(), ip.into(), "-j".into(), "DROP".into()],
+            ],
+            "OUTPUT" => vec![vec!["-D".into(), "OUTPUT".into(), "-d".into(), ip.into(), "-j".into(), "DROP".into()]],
+            _ => vec![vec!["-D".into(), "INPUT".into(), "-s".into(), ip.into(), "-j".into(), "DROP".into()]],
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        for args in &specs {
+            if let Err(e) = run_iptables(args) {
+                warn!("unblock_ip: rimozione regola fallita ({}): {}", args.join(" "), e);
+                failures.push(e.to_string());
             }
         }
 
-        self.state.lock().unwrap().blocked_ips.retain(|b| b != ip);
-        info!("IP sbloccato: {}", ip);
-        Ok(format!("IP {ip} sbloccato"))
+        self.lock_state().blocked_ips.retain(|b| b != ip);
+
+        if failures.len() == specs.len() {
+            anyhow::bail!(
+                "unblock_ip {ip}: tutti i {} tentativi di rimozione sono falliti: {}",
+                specs.len(),
+                failures.join("; ")
+            );
+        }
+
+        info!("IP sbloccato: {} ({}/{} rimozioni riuscite)", ip, specs.len() - failures.len(), specs.len());
+        Ok(format!("IP {ip} sbloccato ({direction})"))
     }
 
     pub fn sync_rules(&self) -> Result<String> {
