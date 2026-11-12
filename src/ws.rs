@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Configurazione TLS condivisa, impostata una volta all'avvio da `init_tls`.
 static TLS_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
@@ -94,55 +94,68 @@ fn secure_config(ca_path: &Path) -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(config))
 }
 
-/// Inizializza la config TLS una volta all'avvio. Con `ca_cert` presente usa la
-/// verifica stretta contro la CA; altrimenti il verifier permissivo, avvisando
-/// che i `wss://` self-signed restano vulnerabili a un MITM attivo.
-pub fn init_tls(ca_cert: Option<&Path>) {
-    let config = match ca_cert {
-        Some(path) => match secure_config(path) {
-            Ok(c) => {
-                info!("TLS: i certificati server sono verificati contro la CA {}", path.display());
-                c
-            }
-            Err(e) => {
-                error!(
-                    "TLS: CA {} non caricabile ({e}); fallback a verifier permissivo (MITM possibile)",
+/// Sceglie la config TLS. Con `ca_cert` configurata usa SOLO la verifica
+/// stretta: se la CA non si carica (file mancante, PEM invalido) è un errore,
+/// non un ripiego sul verifier permissivo — prima un errore di provisioning
+/// della CA spegneva in silenzio la verifica (HIGH, seconda review 2026-11).
+/// Senza `ca_cert` il verifier permissivo è ammesso solo con l'opt-in
+/// esplicito `allow_insecure_tls`.
+fn select_config(
+    ca_cert: Option<&Path>,
+    allow_insecure_tls: bool,
+) -> Result<Arc<rustls::ClientConfig>> {
+    match ca_cert {
+        Some(path) => {
+            let c = secure_config(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "TLS: CA {} non caricabile ({e}); l'agent non si connette a target wss:// \
+                     senza poter verificare il certificato del server",
                     path.display()
-                );
-                insecure_config()
-            }
-        },
-        None => {
-            // Config::validate (src/config.rs) rifiuta già l'avvio su un
-            // target wss:// senza ca_cert A MENO che allow_insecure_tls non
-            // sia stato impostato esplicitamente — se arriviamo qui con un
-            // target wss:// è perché quell'opt-in è attivo.
+                )
+            })?;
+            info!("TLS: i certificati server sono verificati contro la CA {}", path.display());
+            Ok(c)
+        }
+        None if allow_insecure_tls => {
             warn!(
                 "TLS: agent.allow_insecure_tls è attivo — i certificati self-signed sono \
                  accettati senza verifica (MITM possibile su wss://). Configura agent.ca_cert \
                  per la verifica stretta."
             );
-            insecure_config()
+            Ok(insecure_config())
         }
-    };
+        None => anyhow::bail!(
+            "TLS: né agent.ca_cert né agent.allow_insecure_tls configurati per un target wss://"
+        ),
+    }
+}
+
+/// Inizializza la config TLS una volta all'avvio. Va chiamata solo se c'è
+/// almeno un target `wss://`; in caso di errore il chiamante deve uscire.
+pub fn init_tls(ca_cert: Option<&Path>, allow_insecure_tls: bool) -> Result<()> {
+    let config = select_config(ca_cert, allow_insecure_tls)?;
     let _ = TLS_CONFIG.set(config);
+    Ok(())
 }
 
-fn tls_config() -> Arc<rustls::ClientConfig> {
-    // Se init_tls non è stato chiamato (es. nei test), default permissivo.
-    TLS_CONFIG.get_or_init(insecure_config).clone()
+fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
+    // Nessun default: senza init_tls riuscito non si apre alcun wss://.
+    TLS_CONFIG
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("TLS non inizializzato: connessione wss:// rifiutata"))
 }
 
-/// Come `tokio_tungstenite::connect_async`, ma per `wss://` usa il verifier
-/// permissivo sopra invece delle CA pubbliche (che rifiuterebbero sempre un
-/// cert self-signed). Per `ws://` è invariato.
+/// Come `tokio_tungstenite::connect_async`, ma per `wss://` usa la config
+/// scelta da `init_tls` (CA Dognet, o verifier permissivo se c'è l'opt-in)
+/// invece delle CA pubbliche. Per `ws://` è invariato.
 pub async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     if url.starts_with("wss://") {
         let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
             url,
             None,
             false,
-            Some(Connector::Rustls(tls_config())),
+            Some(Connector::Rustls(tls_config()?)),
         )
         .await?;
         Ok(ws)
@@ -154,8 +167,23 @@ pub async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStre
 
 #[cfg(test)]
 mod tests {
-    use super::secure_config;
+    use super::{secure_config, select_config};
     use std::path::Path;
+
+    #[test]
+    fn ca_configurata_ma_non_caricabile_e_un_errore_anche_con_opt_in() {
+        // Regressione (seconda review, 2026-11): una CA configurata ma
+        // illeggibile ricadeva sul verifier permissivo (MITM possibile).
+        let missing = Path::new("/non/esiste/dognet-ca.pem");
+        assert!(select_config(Some(missing), false).is_err());
+        assert!(select_config(Some(missing), true).is_err());
+    }
+
+    #[test]
+    fn senza_ca_serve_l_opt_in() {
+        assert!(select_config(None, false).is_err());
+        assert!(select_config(None, true).is_ok());
+    }
 
     #[test]
     fn secure_config_rifiuta_file_inesistente() {

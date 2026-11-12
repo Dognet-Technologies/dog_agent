@@ -66,9 +66,18 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Inizializza la verifica TLS (Root CA Dognet se configurata, altrimenti
-    // verifier permissivo con warning). Una volta, prima di aprire connessioni.
-    ws::init_tls(config.agent.ca_cert.as_deref());
+    // Inizializza la verifica TLS (Root CA Dognet se configurata, verifier
+    // permissivo solo con allow_insecure_tls). Una volta, prima di aprire
+    // connessioni; se la CA configurata non si carica l'agent NON parte.
+    if config.targets.iter().any(|t| t.ws_url().starts_with("wss://")) {
+        if let Err(e) = ws::init_tls(
+            config.agent.ca_cert.as_deref(),
+            config.agent.allow_insecure_tls,
+        ) {
+            error!("{e:#}");
+            std::process::exit(1);
+        }
+    }
 
     // L'api_key è in chiaro nel file di config: avvisa se è leggibile da altri.
     warn_if_config_insecure(&args.config);
