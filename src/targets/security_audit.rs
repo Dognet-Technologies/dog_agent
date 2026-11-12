@@ -29,21 +29,27 @@ pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
         return unavailable("python3 non disponibile sul target".to_string());
     }
 
-    // Il pid di processo da solo NON basta: è lo stesso per TUTTA la vita
-    // del processo, non per-call — con due target configurati su questo
-    // stesso agent, due security_audit_scan concorrenti condividerebbero lo
-    // stesso path, leggendo/cancellando il file l'uno dell'altro (HIGH
-    // trovato in code review, 2026-11). Un contatore atomico per-call,
-    // come già fa `run_shell::SHELL_SEQ` per lo stesso identico motivo,
-    // rende il path univoco per ogni esecuzione.
-    static AUDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = AUDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let out_path = format!("/tmp/security-audit-{}-{}.json", std::process::id(), seq);
+    // Directory privata per-call (uuid, 0700): il path deve essere univoco
+    // tra scansioni concorrenti di target diversi E non prevedibile — prima
+    // era /tmp/security-audit-{pid}-{seq}.json, su cui un utente locale
+    // poteva piazzare un symlink o un JSON falso letto poi come risultato
+    // dell'audit (HIGH, seconda review 2026-11).
+    let dir = match super::hardening::create_private_tmp_dir("security-audit") {
+        Ok(d) => d,
+        Err(e) => return failed(format!("creazione directory temporanea: {e}")),
+    };
+    let out_path = dir.join("audit.json").to_string_lossy().into_owned();
+    let outcome = run_in_dir(modules, &out_path);
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+fn run_in_dir(modules: &str, out_path: &str) -> SecurityAuditOutcome {
     let cmd = format!(
         "python3 {} -m {} -f JSON -o {} -q --no-cache",
         AUDIT_SCRIPT,
         shell_quote(modules),
-        shell_quote(&out_path)
+        shell_quote(out_path)
     );
 
     let (code, output, timed_out) = super::hardening::run_shell(&cmd, AUDIT_TIMEOUT_SECS);
@@ -54,18 +60,16 @@ pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
     // essere assente, parziale o una vecchia scansione mai pulita — prima
     // di questo fix il codice di uscita non veniva controllato affatto.
     if code != 0 {
-        let _ = std::fs::remove_file(&out_path);
         return failed(format!(
             "script terminato con exit {code}: {}",
             output.lines().last().unwrap_or("(nessun output)")
         ));
     }
 
-    let raw = match std::fs::read_to_string(&out_path) {
+    let raw = match std::fs::read_to_string(out_path) {
         Ok(s) => s,
         Err(e) => return failed(format!("lettura output fallita (exit {code}): {e}")),
     };
-    let _ = std::fs::remove_file(&out_path);
 
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,

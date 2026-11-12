@@ -277,15 +277,71 @@ fn apply_owner_mode(path: &str, task: &Value) -> Result<(), String> {
 /// scrivendo su questi file. Il vero controllo di autorizzazione su CHI può
 /// inviare un comando `execute_hardening`/`apply_remediation` vive a monte
 /// (nel master): questo è un secondo strato di difesa, non l'unico.
+///
+/// Il confronto è per componenti sul path normalizzato E su quello con i
+/// symlink risolti (la scrittura segue i symlink): prima era un confronto
+/// esatto di stringhe, aggirabile con `/etc//shadow`, `/etc/./passwd`,
+/// `/tmp/../etc/shadow` o un symlink verso un file protetto (HIGH, seconda
+/// review 2026-11). Path relativi o con `..` sono rifiutati in blocco.
+///
+/// NB: le azioni `command`/`script` eseguono shell arbitraria per design,
+/// quindi questa lista protegge dagli errori dei template sulle azioni file,
+/// non da un template ostile: quello va fermato a monte (firma dei template).
 fn is_protected_path(path: &str) -> bool {
-    const DENYLIST_EXACT: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/sudoers"];
-    if DENYLIST_EXACT.contains(&path) {
+    use std::path::{Component, Path, PathBuf};
+
+    let raw = Path::new(path);
+    if !raw.is_absolute() || raw.components().any(|c| matches!(c, Component::ParentDir)) {
         return true;
     }
-    if path.starts_with("/etc/sudoers.d/") {
+    // Normalizzazione lessicale: components() elimina già `.` e `//`.
+    let lexical: PathBuf = raw.components().collect();
+    // Con i symlink risolti: il file se esiste, altrimenti la directory padre.
+    let resolved = std::fs::canonicalize(&lexical).ok().or_else(|| {
+        let parent = std::fs::canonicalize(lexical.parent()?).ok()?;
+        Some(parent.join(lexical.file_name()?))
+    });
+    std::iter::once(lexical.as_path())
+        .chain(resolved.as_deref())
+        .any(is_protected_normalized)
+}
+
+/// Regole della denylist su un path assoluto già normalizzato.
+fn is_protected_normalized(path: &std::path::Path) -> bool {
+    use std::path::Path;
+
+    /// File di credenziali/privilegi (e le loro copie `-` di shadow-utils).
+    const EXACT: &[&str] = &[
+        "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
+        "/etc/passwd", "/etc/passwd-", "/etc/group", "/etc/group-",
+        "/etc/sudoers", "/etc/ld.so.preload", "/etc/security/opasswd",
+    ];
+    /// Directory il cui intero contenuto è fuori portata della DSL: sudo,
+    /// config dell'agent stesso (ca_cert/allow_insecure_tls), binari e
+    /// librerie di sistema, script della suite eseguiti come root.
+    const TREES: &[&str] = &[
+        "/etc/sudoers.d", "/etc/dog-agent", "/root/.ssh",
+        "/bin", "/sbin", "/lib", "/lib64", "/usr/bin", "/usr/sbin",
+        "/usr/lib", "/usr/lib64", "/usr/local/bin", "/usr/local/sbin",
+        "/opt/sentinelsuite",
+    ];
+
+    if EXACT.iter().any(|p| path == Path::new(p)) {
         return true;
     }
-    path.ends_with("/authorized_keys") || path.ends_with("/authorized_keys2")
+    if TREES.iter().any(|t| path.starts_with(t)) {
+        return true;
+    }
+    // Qualunque ~/.ssh (authorized_keys, chiavi private, config).
+    if path.components().any(|c| c.as_os_str() == ".ssh") {
+        return true;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "authorized_keys" || name == "authorized_keys2" {
+        return true;
+    }
+    // Chiavi host SSH: /etc/ssh/ssh_host_*  (sshd_config resta scrivibile).
+    path.starts_with("/etc/ssh") && name.starts_with("ssh_host_")
 }
 
 fn act_file_content(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
@@ -648,7 +704,29 @@ fn act_script(task: &Value, dry: bool) -> Result<String, String> {
     Ok("script ok".into())
 }
 
-static SHELL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Tetto all'output letto da un comando: un comando verboso (o un `yes`)
+/// non deve poter riempire la memoria dell'agent.
+const MAX_SHELL_OUTPUT_BYTES: u64 = 1024 * 1024;
+
+/// Crea `<temp_dir>/<prefix>-<uuid>` con mode 0700. `create` (non
+/// `create_all`) fallisce se il path esiste già, quindi nessuno può
+/// predisporlo in anticipo con permessi o symlink propri.
+pub(crate) fn create_private_tmp_dir(prefix: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+/// Legge al più `MAX_SHELL_OUTPUT_BYTES` da `path` (UTF-8 lossy).
+fn read_capped(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(MAX_SHELL_OUTPUT_BYTES).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
 /// Esegue un comando shell con timeout robusto. Punto chiave: l'output NON viene
 /// convogliato in una pipe verso l'agent ma REINDIRIZZATO su un file, così i
@@ -659,7 +737,6 @@ static SHELL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     // Tetto assoluto per non far bloccare un singolo task troppo a lungo
@@ -671,8 +748,16 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
         .unwrap_or(300);
     let timeout_secs = timeout_secs.min(max_secs);
 
-    let seq = SHELL_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = format!("/tmp/cs-hardening-{}-{}.out", std::process::id(), seq);
+    // Output in una directory privata per-call (nome non prevedibile, 0700,
+    // creata solo se non esiste): prima era /tmp/cs-hardening-{pid}-{seq}.out,
+    // un nome prevedibile su cui un utente locale poteva piazzare un symlink
+    // e far scrivere root altrove (HIGH, seconda review 2026-11).
+    let dir = match create_private_tmp_dir("cs-hardening") {
+        Ok(d) => d,
+        Err(e) => return (-1, format!("creazione directory temporanea: {e}"), false),
+    };
+    let tmp_path = dir.join("out");
+    let tmp = tmp_path.to_string_lossy().into_owned();
     // Redirect a file + stdin da /dev/null (niente prompt interattivi).
     // `cmd` può arrivare con una o più righe vuote/newline finali (es. testo
     // salvato con un newline di chiusura, comune per qualsiasi editor/tool):
@@ -684,7 +769,11 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
     // NIST-AC-013/ISO27001-A.8.5-005 in CyberSheppard-Microsiem, 2026-09-20).
     // `trim_end()` + newline (mai `;`) come separatore prima di `}` è
     // robusto qualunque sia la formattazione finale di `cmd`.
-    let full = format!("{{ {}\n}} </dev/null >{} 2>&1", cmd.trim_end(), tmp);
+    let full = format!(
+        "{{ {}\n}} </dev/null >'{}' 2>&1",
+        cmd.trim_end(),
+        tmp.replace('\'', "'\\''")
+    );
 
     let spawn = Command::new("bash")
         .arg("-c")
@@ -722,7 +811,7 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
             Err(_) => break,
         }
     }
-    let out = std::fs::read_to_string(&tmp).unwrap_or_default();
+    let out = read_capped(&tmp_path);
     // Se il comando è fallito ma non abbiamo catturato nessun output, il file
     // di supporto per il post-mortem vale più della pulizia immediata - un
     // fallimento "muto" (es. errore di parsing della shell prima ancora che
@@ -731,7 +820,7 @@ pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
     if code != 0 && out.trim().is_empty() {
         warn!(tmp = %tmp, code, cmd = %first_line(cmd), "run_shell: uscita non-zero senza output catturato, file mantenuto per diagnosi");
     } else {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     (code, out, timed_out)
 }
@@ -940,6 +1029,53 @@ mod tests {
         for p in ["/etc/ssh/sshd_config", "/etc/login.defs", "/etc/sysctl.d/99-x.conf", "/boot/grub/grub.cfg"] {
             assert!(!is_protected_path(p), "{p} non doveva essere protetto");
         }
+    }
+
+    #[test]
+    fn is_protected_path_non_aggirabile_con_varianti_del_path() {
+        // Regressione (seconda review, 2026-11): il confronto esatto di
+        // stringhe lasciava passare queste forme dello stesso file.
+        for p in [
+            "/etc//shadow", "/etc/./passwd", "/tmp/../etc/shadow", "etc/shadow",
+            "/etc/sudoers.d", "/etc/ld.so.preload", "/etc/group",
+            "/home/u/.ssh/id_ed25519", "/etc/ssh/ssh_host_ed25519_key",
+            "/etc/dog-agent/agent.conf", "/usr/bin/sudo", "/usr/local/bin/x",
+        ] {
+            assert!(is_protected_path(p), "{p} doveva essere protetto");
+        }
+    }
+
+    #[test]
+    fn run_shell_usa_una_directory_privata_e_la_rimuove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = create_private_tmp_dir("dog-agent-test").unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        // create() su un path già esistente deve fallire.
+        assert!(std::fs::DirBuilder::new().create(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700);
+
+        let (code, out, timed_out) = run_shell("echo $PWD >/dev/null; echo ok", 5);
+        assert_eq!((code, out.trim(), timed_out), (0, "ok", false));
+    }
+
+    #[test]
+    fn is_protected_path_segue_i_symlink() {
+        let dir = std::env::temp_dir().join(format!("dog-agent-prot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Symlink al file e alla directory: in entrambi i casi la scrittura
+        // finirebbe su un path protetto.
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("innocuo.conf")).unwrap();
+        std::os::unix::fs::symlink("/etc/sudoers.d", dir.join("conf.d")).unwrap();
+        let via_file = dir.join("innocuo.conf").to_string_lossy().into_owned();
+        let via_dir = dir.join("conf.d/nuovo").to_string_lossy().into_owned();
+        let normale = dir.join("normale.conf").to_string_lossy().into_owned();
+        let (a, b, c) = (is_protected_path(&via_file), is_protected_path(&via_dir), is_protected_path(&normale));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(a, "symlink a /etc/passwd non rilevato");
+        assert!(b, "symlink a /etc/sudoers.d non rilevato");
+        assert!(!c);
     }
 
     #[test]
