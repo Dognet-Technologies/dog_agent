@@ -31,7 +31,7 @@ toml = "0.8"
 regex = "1"
 
 # Compression (CyberShepherd)
-zstd = "0.13"
+zstd = "0.13.4"
 
 # Hashing (file integrity)
 sha2 = "0.10"
