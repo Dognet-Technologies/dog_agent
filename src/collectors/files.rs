@@ -33,10 +33,16 @@ pub async fn collect() -> Result<FilesMetrics> {
     collect_paths(&paths).await
 }
 
+/// Tempo massimo di un check_integrity: sotto il timeout di dispatch (90s)
+/// del comando, così il walk si ferma da solo invece di continuare in un
+/// thread bloccante dopo che il comando è già stato dato per fallito.
+const INTEGRITY_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(75);
+
 /// Verifica integrità su percorsi specifici (usata da comando check_integrity)
 pub async fn check_integrity(paths: &[String]) -> Result<Vec<FileHash>> {
     let paths_owned = paths.to_vec();
-    tokio::task::spawn_blocking(move || hash_paths(&paths_owned))
+    let deadline = std::time::Instant::now() + INTEGRITY_CHECK_BUDGET;
+    tokio::task::spawn_blocking(move || hash_paths_until(&paths_owned, Some(deadline)))
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
@@ -65,6 +71,12 @@ fn collect_sync(paths: &[String]) -> Result<FilesMetrics> {
 }
 
 fn hash_paths(paths: &[String]) -> Result<Vec<FileHash>> {
+    hash_paths_until(paths, None)
+}
+
+/// Come `hash_paths`, ma oltre `deadline` si ferma con un errore invece di
+/// continuare a girare in un thread bloccante.
+fn hash_paths_until(paths: &[String], deadline: Option<std::time::Instant>) -> Result<Vec<FileHash>> {
     let mut hashes = Vec::new();
 
     for base in paths {
@@ -75,6 +87,13 @@ fn hash_paths(paths: &[String]) -> Result<Vec<FileHash>> {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                anyhow::bail!(
+                    "check_integrity interrotto dopo {:?}: {} file verificati",
+                    INTEGRITY_CHECK_BUDGET,
+                    hashes.len()
+                );
+            }
             let path = entry.path();
             if let Ok(hash) = hash_file(path) {
                 hashes.push(hash);
@@ -101,10 +120,12 @@ fn hash_file(path: &Path) -> Result<FileHash> {
             MAX_HASH_FILE_SIZE_BYTES
         );
     }
-    let data = std::fs::read(path)?;
-
+    // Hash a blocchi: prima il file (fino a 100 MiB) veniva letto tutto in
+    // memoria, per ogni file del walk.
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
     let mut hasher = Sha512::new();
-    hasher.update(&data);
+    std::io::copy(&mut file.take(MAX_HASH_FILE_SIZE_BYTES), &mut hasher)?;
     let digest = hex::encode(hasher.finalize());
 
     let modified_at = meta

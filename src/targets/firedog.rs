@@ -303,7 +303,46 @@ async fn execute_command(
     action: CommandAction,
     payload: serde_json::Value,
 ) -> (CommandStatus, Option<String>, Option<String>) {
-    let result = match action {
+    let result = if matches!(action, CommandAction::CheckIntegrity) {
+        // `paths` richiesti dal server sono SOLO un filtro, non possono
+        // ampliare l'insieme configurato localmente in integrity_paths:
+        // altrimenti il server potrebbe usare questo comando come
+        // oracolo di lettura (hash/size/mtime) su qualunque file del
+        // filesystem (CRITICAL trovato in code review, 2026-11).
+        let requested = serde_json::from_value::<CheckIntegrityPayload>(payload)
+            .ok()
+            .and_then(|p| p.paths);
+        let paths = filter_integrity_paths(requested, &config.integrity_paths);
+        run_integrity_check(&paths).await
+    } else {
+        // Il resto (iptables, firewall-manager, scrittura config) è
+        // bloccante: eseguito qui direttamente occupava il thread del
+        // runtime e il timeout di dispatch non poteva mai scattare (scatta
+        // solo a un .await). In spawn_blocking il timeout libera la
+        // sessione; il processo figlio eventualmente bloccato resta loggato.
+        let (cfg, fw) = (config.clone(), fw.clone());
+        tokio::task::spawn_blocking(move || execute_blocking(&cfg, &fw, action, payload))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("task del comando terminato: {e}")))
+    };
+
+    match result {
+        Ok(out) => (CommandStatus::Success, Some(out), None),
+        Err(e) => {
+            error!("[{}] Comando {} fallito: {}", config.name, command_id, e);
+            (CommandStatus::Failed, None, Some(e.to_string()))
+        }
+    }
+}
+
+/// Comandi FireDog sincroni (tutti tranne check_integrity).
+fn execute_blocking(
+    config: &TargetConfig,
+    fw: &FirewallManager,
+    action: CommandAction,
+    payload: serde_json::Value,
+) -> Result<String> {
+    match action {
         CommandAction::AddRule => {
             match serde_json::from_value::<AddRulePayload>(payload) {
                 Ok(p) => fw.add_rule(&p),
@@ -332,16 +371,7 @@ async fn execute_command(
             fw.sync_rules()
         }
         CommandAction::CheckIntegrity => {
-            // `paths` richiesti dal server sono SOLO un filtro, non possono
-            // ampliare l'insieme configurato localmente in integrity_paths:
-            // altrimenti il server potrebbe usare questo comando come
-            // oracolo di lettura (hash/size/mtime) su qualunque file del
-            // filesystem (CRITICAL trovato in code review, 2026-11).
-            let requested = serde_json::from_value::<CheckIntegrityPayload>(payload)
-                .ok()
-                .and_then(|p| p.paths);
-            let paths = filter_integrity_paths(requested, &config.integrity_paths);
-            run_integrity_check(&paths).await
+            Err(anyhow::anyhow!("check_integrity gestito in execute_command"))
         }
         CommandAction::UpdateConfig => {
             match serde_json::from_value::<ThreatConfigUpdatePayload>(payload) {
@@ -357,14 +387,6 @@ async fn execute_command(
         }
         CommandAction::Unknown => {
             Err(anyhow::anyhow!("Azione non riconosciuta"))
-        }
-    };
-
-    match result {
-        Ok(out) => (CommandStatus::Success, Some(out), None),
-        Err(e) => {
-            error!("[{}] Comando {} fallito: {}", config.name, command_id, e);
-            (CommandStatus::Failed, None, Some(e.to_string()))
         }
     }
 }
@@ -602,9 +624,55 @@ fn update_target_config_file(
         }
     }
 
-    std::fs::write(path, lines.join("\n") + "\n")
+    // agent.conf contiene l'api_key: 0600 se per qualche motivo non ha già
+    // permessi propri da conservare.
+    write_atomic(path, &(lines.join("\n") + "\n"), 0o600)
         .with_context(|| format!("Impossibile scrivere {}", path.display()))?;
     Ok(())
+}
+
+/// Scrittura atomica: file temporaneo nella stessa directory, con permessi
+/// e proprietario dell'originale (`default_mode` se non esiste), fsync,
+/// rename. Prima `std::fs::write` troncava e riscriveva sul posto: un crash
+/// o un disco pieno a metà lasciava agent.conf vuoto o troncato, e l'agent
+/// non ripartiva più.
+fn write_atomic(path: &std::path::Path, content: &str, default_mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let existing = std::fs::metadata(path).ok();
+    let mode = existing.as_ref().map_or(default_mode, |m| m.mode() & 0o7777);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path senza nome file: {}", path.display()))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
+
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        if let Some(m) = &existing {
+            // Best-effort: senza privilegi il chown a un altro gruppo
+            // fallisce, e non è un motivo per non aggiornare la config.
+            if let Err(e) = std::os::unix::fs::fchown(&f, Some(m.uid()), Some(m.gid())) {
+                warn!("{}: proprietario originale non ripristinato: {e}", path.display());
+            }
+        }
+        f.write_all(content.as_bytes())?;
+        f.sync_all()
+    })();
+    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(Into::into)
 }
 
 /// Path del file letto da `firewall-manager.py`/`traffic-analyzer.py`
@@ -652,6 +720,7 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
     }
     if let Some(ref save_path) = p.pcap_save_path {
         reject_unsafe_conf_value("pcap_save_path", save_path)?;
+        validate_pcap_save_path(save_path)?;
     }
     if let Some(ref filters) = p.pcap_custom_filters {
         for f in filters {
@@ -698,7 +767,7 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
         anyhow::bail!("Nessun campo da aggiornare nel payload");
     }
 
-    std::fs::write(path, lines.join("\n") + "\n")
+    write_atomic(path, &(lines.join("\n") + "\n"), 0o644)
         .with_context(|| format!("Impossibile scrivere {}", path.display()))?;
 
     Ok(format!("Config pcap aggiornata ({changed} campi)"))
@@ -725,6 +794,25 @@ fn bash_single_quote(value: &str) -> String {
 /// esplicitamente (errore chiaro all'admin) che silenziosamente disallineare
 /// i due lati. Un newline romperebbe comunque il formato una-riga-per-chiave
 /// a prescindere dal quoting.
+/// PCAP_SAVE_PATH è usato come root da firewall-manager.py/traffic-analyzer.py
+/// per leggere e scrivere catture: deve essere assoluto, senza `..` e fuori
+/// dalle directory di sistema. Default FireDog: /var/log/ulogd.
+fn validate_pcap_save_path(value: &str) -> Result<()> {
+    use std::path::{Component, Path};
+    const SYSTEM_TREES: &[&str] = &[
+        "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/boot",
+        "/root", "/proc", "/sys", "/dev", "/run",
+    ];
+    let p = Path::new(value);
+    if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+        anyhow::bail!("pcap_save_path deve essere un path assoluto senza '..': {value:?}");
+    }
+    if p.parent().is_none() || SYSTEM_TREES.iter().any(|t| p.starts_with(t)) {
+        anyhow::bail!("pcap_save_path non può stare in una directory di sistema: {value:?}");
+    }
+    Ok(())
+}
+
 fn reject_unsafe_conf_value(field: &str, value: &str) -> Result<()> {
     if value.contains('\'') {
         anyhow::bail!("{field}: non può contenere l'apice singolo (')");
@@ -967,5 +1055,43 @@ mod host_port_tests {
         assert_eq!(host_port("wss://[2001:db8::1]/ws/agent/").as_deref(), Some("[2001:db8::1]:443"));
         assert_eq!(host_port("wss://[2001:db8::1]:8443/x").as_deref(), Some("[2001:db8::1]:8443"));
         assert_eq!(host_port("http://x"), None);
+    }
+}
+
+#[cfg(test)]
+mod conf_write_tests {
+    use super::{validate_pcap_save_path, write_atomic};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn pcap_save_path_fuori_dalle_directory_di_sistema() {
+        for ok in ["/var/log/ulogd", "/var/log/ulogd/input_dropped.pcap", "/data/pcap"] {
+            assert!(validate_pcap_save_path(ok).is_ok(), "{ok} doveva essere accettato");
+        }
+        for bad in ["/", "var/log", "/var/log/../../etc/cron.d/x", "/etc/cron.d/x", "/usr/bin/x", "/root/p"] {
+            assert!(validate_pcap_save_path(bad).is_err(), "{bad} doveva essere rifiutato");
+        }
+    }
+
+    #[test]
+    fn write_atomic_conserva_i_permessi_e_non_lascia_temporanei() {
+        let dir = std::env::temp_dir().join(format!("dog-agent-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("agent.conf");
+        std::fs::write(&conf, "vecchio\n").unwrap();
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomic(&conf, "nuovo\n", 0o600).unwrap();
+        let mode = std::fs::metadata(&conf).unwrap().permissions().mode() & 0o777;
+        let content = std::fs::read_to_string(&conf).unwrap();
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+
+        write_atomic(&dir.join("nuovo.conf"), "x", 0o600).unwrap();
+        let new_mode = std::fs::metadata(dir.join("nuovo.conf")).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((mode, content.as_str(), entries), (0o640, "nuovo\n", 1));
+        assert_eq!(new_mode, 0o600);
     }
 }
