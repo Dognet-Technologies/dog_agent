@@ -370,17 +370,47 @@ async fn execute_command(
 /// mai ampliarlo. Senza questo, il server potrebbe usare `check_integrity`
 /// come oracolo di lettura (hash/size/mtime) su qualunque file del
 /// filesystem (CRITICAL trovato in code review, 2026-11).
+///
+/// Il confronto NON è sulla stringa: `/etc/../root/.ssh` inizia con `/etc/`
+/// ma il kernel lo risolve in `/root/.ssh`, e un symlink sotto una root
+/// configurata (es. `/var/www/x -> /root`) porta fuori allo stesso modo.
+/// Si scartano quindi i path con componenti `..` e si confrontano per
+/// componenti i path canonicalizzati (symlink risolti); al walk passa il
+/// path canonico, non quello richiesto. Un path inesistente viene scartato:
+/// non c'è nulla da hashare.
 fn filter_integrity_paths(requested: Option<Vec<String>>, configured: &[String]) -> Vec<String> {
-    match requested {
-        None => configured.to_vec(),
-        Some(requested) => requested
-            .into_iter()
-            .filter(|r| {
-                configured
-                    .iter()
-                    .any(|allowed| r == allowed || r.starts_with(&format!("{allowed}/")))
-            })
-            .collect(),
+    let Some(requested) = requested else {
+        return configured.to_vec();
+    };
+    let allowed_roots: Vec<std::path::PathBuf> = configured
+        .iter()
+        .filter_map(|c| std::fs::canonicalize(c).ok())
+        .collect();
+    requested
+        .into_iter()
+        .filter_map(|r| resolve_within(&r, &allowed_roots))
+        .collect()
+}
+
+/// Path canonico di `requested` se è assoluto, senza componenti `..` e,
+/// a symlink risolti, dentro una delle `allowed_roots` (già canonicalizzate).
+fn resolve_within(requested: &str, allowed_roots: &[std::path::PathBuf]) -> Option<String> {
+    use std::path::{Component, Path};
+    let path = Path::new(requested);
+    let lexically_clean = path.is_absolute()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !lexically_clean {
+        warn!("check_integrity: path '{requested}' rifiutato (non assoluto o con ..)");
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+        canonical.to_str().map(str::to_owned)
+    } else {
+        warn!("check_integrity: path '{requested}' fuori da integrity_paths, ignorato");
+        None
     }
 }
 
@@ -791,6 +821,37 @@ mod update_target_config_file_tests {
 #[cfg(test)]
 mod filter_integrity_paths_tests {
     use super::filter_integrity_paths;
+    use std::path::PathBuf;
+
+    /// Albero temporaneo: <base>/allowed/{file,sub/} e <base>/secret/key,
+    /// più un symlink <base>/allowed/escape -> <base>/secret.
+    struct Tree {
+        base: PathBuf,
+    }
+
+    impl Tree {
+        fn new(tag: &str) -> Self {
+            let base = std::env::temp_dir()
+                .join(format!("dog-agent-integrity-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("allowed/sub")).unwrap();
+            std::fs::create_dir_all(base.join("secret")).unwrap();
+            std::fs::write(base.join("allowed/file"), b"x").unwrap();
+            std::fs::write(base.join("secret/key"), b"k").unwrap();
+            std::os::unix::fs::symlink(base.join("secret"), base.join("allowed/escape")).unwrap();
+            let base = std::fs::canonicalize(&base).unwrap();
+            Tree { base }
+        }
+        fn p(&self, rel: &str) -> String {
+            self.base.join(rel).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
 
     #[test]
     fn nessuna_richiesta_usa_tutto_il_configurato() {
@@ -802,29 +863,55 @@ mod filter_integrity_paths_tests {
     fn richiesta_fuori_dal_configurato_e_scartata() {
         // Regressione: il server non deve poter usare check_integrity come
         // oracolo di lettura su un path arbitrario fuori da quanto già
-        // configurato localmente (es. /root/.ssh, o /dev/zero per un DoS).
-        // Un sottopercorso di una root GIA' configurata (es. /etc/shadow
-        // quando /etc è in integrity_paths) non è invece una nuova
-        // esposizione: una scan illimitata di /etc lo includerebbe comunque
-        // già oggi — è il comportamento normale del file-integrity-monitoring.
-        let configured = vec!["/etc".to_string()];
-        let requested = vec!["/etc/ssh".to_string(), "/root/.ssh".to_string(), "/dev/zero".to_string()];
+        // configurato localmente. Un sottopercorso di una root GIA'
+        // configurata non è invece una nuova esposizione.
+        let t = Tree::new("fuori");
+        let configured = vec![t.p("allowed")];
+        let requested = vec![t.p("allowed/sub"), t.p("secret"), "/dev/zero".to_string()];
         let out = filter_integrity_paths(Some(requested), &configured);
-        assert_eq!(out, vec!["/etc/ssh".to_string()]);
+        assert_eq!(out, vec![t.p("allowed/sub")]);
     }
 
     #[test]
     fn richiesta_esattamente_uguale_a_un_path_configurato_e_accettata() {
-        let configured = vec!["/usr/bin".to_string()];
-        let out = filter_integrity_paths(Some(vec!["/usr/bin".to_string()]), &configured);
-        assert_eq!(out, vec!["/usr/bin".to_string()]);
+        let t = Tree::new("uguale");
+        let configured = vec![t.p("allowed")];
+        let out = filter_integrity_paths(Some(vec![t.p("allowed")]), &configured);
+        assert_eq!(out, vec![t.p("allowed")]);
     }
 
     #[test]
     fn prefisso_senza_separatore_non_basta() {
-        // "/etcfoo" non è un sottopercorso di "/etc".
-        let configured = vec!["/etc".to_string()];
-        let out = filter_integrity_paths(Some(vec!["/etcfoo".to_string()]), &configured);
+        // "<base>/allowedfoo" non è un sottopercorso di "<base>/allowed".
+        let t = Tree::new("prefisso");
+        std::fs::create_dir_all(t.base.join("allowedfoo")).unwrap();
+        let configured = vec![t.p("allowed")];
+        let out = filter_integrity_paths(Some(vec![t.p("allowedfoo")]), &configured);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dot_dot_non_esce_dalla_root_configurata() {
+        // Regressione (seconda review, 2026-11): il confronto per stringa
+        // accettava "<allowed>/../secret" perché inizia con "<allowed>/".
+        let t = Tree::new("dotdot");
+        let configured = vec![t.p("allowed")];
+        let requested = vec![t.p("allowed/../secret"), t.p("allowed/sub/../../secret/key")];
+        assert!(filter_integrity_paths(Some(requested), &configured).is_empty());
+    }
+
+    #[test]
+    fn symlink_sotto_la_root_non_porta_fuori() {
+        let t = Tree::new("symlink");
+        let configured = vec![t.p("allowed")];
+        let requested = vec![t.p("allowed/escape"), t.p("allowed/escape/key")];
+        assert!(filter_integrity_paths(Some(requested), &configured).is_empty());
+    }
+
+    #[test]
+    fn path_relativo_e_scartato() {
+        let t = Tree::new("relativo");
+        let configured = vec![t.p("allowed")];
+        assert!(filter_integrity_paths(Some(vec!["allowed/file".into()]), &configured).is_empty());
     }
 }
