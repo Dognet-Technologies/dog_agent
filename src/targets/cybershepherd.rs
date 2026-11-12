@@ -6,7 +6,9 @@
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio::time::interval;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -17,13 +19,24 @@ use crate::config::TargetConfig;
 use crate::protocol::cybershepherd::*;
 use crate::reconnect::Reconnect;
 
+/// Coda verso il writer task della sessione.
+type Out = tokio::sync::mpsc::Sender<Message>;
+
+/// Attesa massima per un posto in coda prima di dare la connessione per
+/// bloccata, per i messaggi che non si possono perdere.
+const RELIABLE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn run(config: TargetConfig) -> Result<()> {
     let mut reconnect = Reconnect::new(&config.reconnect);
+    // Hardening, audit e remediation girano uno alla volta per target. Il
+    // semaforo vive fuori dalla sessione: dopo un reconnect un nuovo comando
+    // aspetta che finisca quello ancora in corso dalla sessione precedente.
+    let long_cmds = Arc::new(Semaphore::new(1));
 
     loop {
         info!("[{}] Connessione a {}", config.name, config.ws_url());
         let started = Instant::now();
-        let result = session(&config).await;
+        let result = session(&config, &long_cmds).await;
         let elapsed = started.elapsed();
 
         match result {
@@ -37,7 +50,7 @@ pub async fn run(config: TargetConfig) -> Result<()> {
     }
 }
 
-async fn session(config: &TargetConfig) -> Result<()> {
+async fn session(config: &TargetConfig, long_cmds: &Arc<Semaphore>) -> Result<()> {
     let ws = crate::ws::connect(&config.ws_url()).await?;
     let (mut ws_tx, mut rx) = ws.split();
 
@@ -92,13 +105,15 @@ async fn session(config: &TargetConfig) -> Result<()> {
     // (es. esito hardening) restavano in coda per decine di secondi. Un task
     // dedicato che possiede il sink e lo polla di continuo elimina il ritardo.
     //
-    // Canale CON bound (256): se la connessione si blocca (rete lenta,
-    // server fermo/MITM) la coda non deve crescere senza limite in memoria
-    // — un `try_send` che fallisce quando piena è preferibile a un OOM
-    // dell'agent (MEDIUM trovato in code review, 2026-11). 256 è
-    // abbondante per il traffico normale (metriche ogni send_interval,
-    // progress di hardening uno per controllo) senza scartare messaggi
-    // legittimi durante un rallentamento transitorio.
+    // Canale CON bound (256): se la connessione si blocca la coda non deve
+    // crescere senza limite in memoria. Due modi di inviare:
+    // - `send_reliable` (esiti dei comandi, stato hardening, eventi di
+    //   sicurezza): attende un posto fino a RELIABLE_SEND_TIMEOUT, poi errore.
+    // - `send_best_effort` (metriche, progress intermedi, pong): se la coda
+    //   è piena il messaggio si scarta con un warn.
+    // Prima tutto passava da `try_send` + `?`: a coda piena si perdeva
+    // l'esito finale di un hardening già applicato e cadeva la sessione
+    // (HIGH, seconda review 2026-11).
     let (out, mut out_rx) = tokio::sync::mpsc::channel::<Message>(256);
     tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
@@ -132,6 +147,14 @@ async fn session(config: &TargetConfig) -> Result<()> {
                             warn!("[{}] Buffer pieno, flush immediato", config.name);
                             flush_buffer(config, &out, &mut buffer, target_id)?;
                         }
+                        // Se la coda resta piena il buffer non va oltre il
+                        // doppio del limite: si scartano le raccolte più vecchie.
+                        let cap = config.max_buffer_size.saturating_mul(2).max(1);
+                        if buffer.len() > cap {
+                            let excess = buffer.len() - cap;
+                            buffer.drain(..excess);
+                            warn!("[{}] {} raccolte metriche scartate (coda WS piena)", config.name, excess);
+                        }
                     }
                     Err(e) => {
                         error!("[{}] Errore raccolta metriche: {}", config.name, e);
@@ -148,10 +171,13 @@ async fn session(config: &TargetConfig) -> Result<()> {
                     let off = laurel_offset;
                     match tokio::task::spawn_blocking(move || read_laurel_events(&path, off)).await {
                         Ok((events, new_off)) => {
-                            laurel_offset = new_off;
+                            // L'offset avanza solo a invio riuscito: in caso
+                            // di errore la sessione cade e gli eventi non
+                            // risultano letti.
                             if !events.is_empty() {
-                                flush_security_events(config, &out, events, target_id)?;
+                                flush_security_events(config, &out, events, target_id).await?;
                             }
+                            laurel_offset = new_off;
                         }
                         Err(e) => error!("[{}] Errore lettura Laurel: {}", config.name, e),
                     }
@@ -161,10 +187,10 @@ async fn session(config: &TargetConfig) -> Result<()> {
             msg = rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_server_message(config, &out, &text, target_id).await?;
+                        handle_server_message(config, &out, &text, target_id, long_cmds).await?;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        out.try_send(Message::Pong(data)).map_err(|e| anyhow::anyhow!("channel: {e}"))?;
+                        send_best_effort(&out, Message::Pong(data), &config.name, "pong")?;
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("[{}] Server ha chiuso la connessione", config.name);
@@ -267,9 +293,42 @@ where
         .map_err(|_| anyhow::anyhow!("Timeout autenticazione (30s)"))?
 }
 
+/// Accoda un messaggio che non si può perdere, attendendo un posto fino a
+/// `RELIABLE_SEND_TIMEOUT`. Errore se il writer è chiuso o la coda resta piena.
+async fn send_reliable(out: &Out, msg: Message) -> Result<()> {
+    send_within(out, msg, RELIABLE_SEND_TIMEOUT).await
+}
+
+async fn send_within(out: &Out, msg: Message, limit: Duration) -> Result<()> {
+    match tokio::time::timeout(limit, out.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => anyhow::bail!("writer WS chiuso"),
+        Err(_) => anyhow::bail!(
+            "coda WS piena da {}s, connessione bloccata",
+            limit.as_secs_f32()
+        ),
+    }
+}
+
+/// Accoda senza attendere. `Ok(false)` se la coda è piena (messaggio
+/// scartato), errore solo se il writer è chiuso.
+fn send_best_effort(out: &Out, msg: Message, name: &str, what: &str) -> Result<bool> {
+    use tokio::sync::mpsc::error::TrySendError;
+    match out.try_send(msg) {
+        Ok(()) => Ok(true),
+        Err(TrySendError::Full(_)) => {
+            warn!("[{name}] coda WS piena: {what} scartato");
+            Ok(false)
+        }
+        Err(TrySendError::Closed(_)) => anyhow::bail!("writer WS chiuso"),
+    }
+}
+
+/// Invia il buffer metriche; se la coda è piena lo lascia intatto per il
+/// prossimo tentativo (il chiamante ne limita la crescita).
 fn flush_buffer(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::Sender<Message>,
+    out: &Out,
     buffer: &mut Vec<AllMetrics>,
     target_id: i32,
 ) -> Result<()> {
@@ -290,16 +349,18 @@ fn flush_buffer(
         payload: compressed,
     };
 
-    out.try_send(Message::Text(serde_json::to_string(&msg)?))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
-    buffer.clear();
+    let text = Message::Text(serde_json::to_string(&msg)?);
+    if send_best_effort(out, text, &config.name, "batch metriche")? {
+        buffer.clear();
+    }
     Ok(())
 }
 
 /// Comprime e invia un batch di eventi Laurel come `SecurityEvents`.
-fn flush_security_events(
+/// Eventi di sicurezza: invio affidabile, non best-effort.
+async fn flush_security_events(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::Sender<Message>,
+    out: &Out,
     events: Vec<serde_json::Value>,
     target_id: i32,
 ) -> Result<()> {
@@ -319,9 +380,7 @@ fn flush_security_events(
         timestamp: chrono::Utc::now().timestamp(),
         payload: compressed,
     };
-    out.try_send(Message::Text(serde_json::to_string(&msg)?))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
-    Ok(())
+    send_reliable(out, Message::Text(serde_json::to_string(&msg)?)).await
 }
 
 /// Tail del file JSON di Laurel: legge le righe nuove da `offset`, ne fa il
@@ -363,9 +422,10 @@ fn read_laurel_events(path: &str, offset: u64) -> (Vec<serde_json::Value>, u64) 
 
 async fn handle_server_message(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::Sender<Message>,
+    out: &Out,
     text: &str,
     target_id: i32,
+    long_cmds: &Arc<Semaphore>,
 ) -> Result<()> {
     let msg: ServerMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -382,20 +442,22 @@ async fn handle_server_message(
         ServerMessage::Command { payload, .. } => {
             info!("[{}] Comando ricevuto: {}", config.name, payload.action);
 
-            if payload.action == "execute_hardening" {
-                // Applica (o simula) un template di hardening e riporta lo stato
-                // come command_response con payload HardeningResponse.
-                run_hardening_command(config, out, target_id, &payload.params).await?;
-            } else if payload.action == "security_audit_scan" {
-                // Esegue il Linux-Security-Audit-Project vendorizzato (sola
-                // lettura) e riporta i risultati come command_response con
-                // payload SecurityAuditResponse.
-                run_security_audit_command(config, out, target_id, &payload.params).await?;
-            } else if payload.action == "apply_remediation" {
-                // Applica UN task ad-hoc della DSL (mappa di remediation
-                // curata per un check specifico) — mai il testo di
-                // remediation del tool esterno alla lettera.
-                run_apply_remediation_command(config, out, target_id, &payload.params).await?;
+            if matches!(
+                payload.action.as_str(),
+                "execute_hardening" | "security_audit_scan" | "apply_remediation"
+            ) {
+                // Comandi lunghi: in un task a parte, così il loop della
+                // sessione continua a rispondere ai ping e a leggere il
+                // server mentre l'hardening gira (prima lo bloccava per
+                // tutta la durata).
+                spawn_long_command(
+                    config.clone(),
+                    out.clone(),
+                    target_id,
+                    payload.action.clone(),
+                    payload.params.clone(),
+                    Arc::clone(long_cmds),
+                );
             } else {
                 // Altri comandi (ping/get_version): risposta generica.
                 let (success, output, error) = execute_command(&payload).await;
@@ -409,8 +471,7 @@ async fn handle_server_message(
                         error,
                     },
                 };
-                out.try_send(Message::Text(serde_json::to_string(&resp)?))
-                    .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
+                send_reliable(out, Message::Text(serde_json::to_string(&resp)?)).await?;
             }
         }
         ServerMessage::AuthAck { .. } => {
@@ -424,12 +485,43 @@ async fn handle_server_message(
     Ok(())
 }
 
+/// Esegue hardening / security audit / remediation in un task tokio,
+/// serializzato da `gate` (un comando lungo alla volta per target: mutano
+/// lo stesso sistema). Gli errori vengono registrati nel log locale.
+fn spawn_long_command(
+    config: TargetConfig,
+    out: Out,
+    target_id: i32,
+    action: String,
+    params: serde_json::Value,
+    gate: Arc<Semaphore>,
+) {
+    tokio::spawn(async move {
+        let Ok(_permit) = gate.acquire_owned().await else {
+            return;
+        };
+        let result = match action.as_str() {
+            // Applica (o simula) un template di hardening: stato come
+            // command_response con payload HardeningResponse.
+            "execute_hardening" => run_hardening_command(&config, &out, target_id, &params).await,
+            // Linux-Security-Audit-Project vendorizzato, sola lettura.
+            "security_audit_scan" => run_security_audit_command(&config, &out, target_id, &params).await,
+            // UN task ad-hoc della DSL (remediation curata per un check),
+            // mai il testo di remediation del tool esterno alla lettera.
+            _ => run_apply_remediation_command(&config, &out, target_id, &params).await,
+        };
+        if let Err(e) = result {
+            error!("[{}] Comando {} fallito: {e:#}", config.name, action);
+        }
+    });
+}
+
 /// Esegue (o simula) un template di hardening ricevuto via comando e riporta
 /// lo stato al server come `command_response` con payload HardeningResponse.
 /// L'esecuzione vera è bloccante → gira in spawn_blocking.
 async fn run_hardening_command(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::Sender<Message>,
+    out: &Out,
     target_id: i32,
     params: &serde_json::Value,
 ) -> Result<()> {
@@ -459,11 +551,15 @@ async fn run_hardening_command(
     );
 
     // Stato iniziale "running".
-    send_hardening_status(
-        out, target_id, exec_id, "running",
-        Some(serde_json::json!({ "total_controls": total, "successful_controls": 0, "failed_controls": 0 })),
-        None,
-    )?;
+    send_reliable(
+        out,
+        hardening_status_msg(
+            target_id, exec_id, "running",
+            Some(serde_json::json!({ "total_controls": total, "successful_controls": 0, "failed_controls": 0 })),
+            None,
+        ),
+    )
+    .await?;
 
     // Esecuzione bloccante con streaming del progresso: dopo ogni controllo
     // l'executor emette un ProgressUpdate (con log parziale) che inoltriamo
@@ -481,16 +577,16 @@ async fn run_hardening_command(
     // reale) resta orfana, detached, mai letta né riportata, e un
     // reconnect potrebbe far ripartire lo stesso comando mentre quella
     // vecchia esecuzione gira ancora in parallelo (HIGH trovato in code
-    // review, 2026-11). Un fallimento d'invio smette solo di provare a
-    // mandare ALTRI progress update, ma continua a drenare il canale e
-    // attende comunque l'esito finale.
+    // review, 2026-11). I progress sono best-effort: a coda piena si salta
+    // quell'aggiornamento; a writer chiuso si smette di inviarne, ma si
+    // continua a drenare il canale e si attende comunque l'esito finale.
     let mut send_failed = false;
     while let Some(u) = prx.recv().await {
         if send_failed {
             continue;
         }
-        if let Err(e) = send_hardening_status(
-            out, target_id, exec_id, "running",
+        let msg = hardening_status_msg(
+            target_id, exec_id, "running",
             Some(serde_json::json!({
                 "total_controls": u.total,
                 "successful_controls": u.successful,
@@ -499,7 +595,8 @@ async fn run_hardening_command(
                 "execution_log": u.log,
             })),
             None,
-        ) {
+        );
+        if let Err(e) = send_best_effort(out, msg, &config.name, "progress hardening") {
             warn!(
                 "[{}] Hardening exec {}: invio progress fallito ({}), continuo ad attendere l'esecuzione",
                 config.name, exec_id, e
@@ -518,7 +615,8 @@ async fn run_hardening_command(
         "rollback_data": outcome.rollback_data,
         "control_results": outcome.control_results,
     });
-    if let Err(e) = send_hardening_status(out, target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref()) {
+    let final_msg = hardening_status_msg(target_id, exec_id, &outcome.status, Some(progress), outcome.error.as_deref());
+    if let Err(e) = send_reliable(out, final_msg).await {
         // L'esecuzione È andata avanti e ha davvero mutato il sistema: se
         // anche l'invio dell'esito finale fallisce, l'unica traccia che
         // resta è questo log locale — meglio di perderla silenziosamente.
@@ -539,7 +637,7 @@ async fn run_hardening_command(
 /// di risposta allo stesso modo già usato per l'hardening).
 async fn run_security_audit_command(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::Sender<Message>,
+    out: &Out,
     target_id: i32,
     params: &serde_json::Value,
 ) -> Result<()> {
@@ -572,8 +670,7 @@ async fn run_security_audit_command(
             "error": outcome.error,
         }
     });
-    out.try_send(Message::Text(msg.to_string()))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
+    send_reliable(out, Message::Text(msg.to_string())).await?;
 
     info!("[{}] Security audit exec {} → {}", config.name, exec_id, outcome.status);
     Ok(())
@@ -586,7 +683,7 @@ async fn run_security_audit_command(
 /// per il dispatch dual-shape lato server.
 async fn run_apply_remediation_command(
     config: &TargetConfig,
-    out: &tokio::sync::mpsc::Sender<Message>,
+    out: &Out,
     target_id: i32,
     params: &serde_json::Value,
 ) -> Result<()> {
@@ -614,21 +711,19 @@ async fn run_apply_remediation_command(
             "error": outcome.error,
         }
     });
-    out.try_send(Message::Text(msg.to_string()))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
+    send_reliable(out, Message::Text(msg.to_string())).await?;
 
     info!("[{}] Apply remediation {} → {}", config.name, apply_id, status);
     Ok(())
 }
 
-fn send_hardening_status(
-    out: &tokio::sync::mpsc::Sender<Message>,
+fn hardening_status_msg(
     target_id: i32,
     execution_id: i64,
     status: &str,
     progress: Option<serde_json::Value>,
     error: Option<&str>,
-) -> Result<()> {
+) -> Message {
     let msg = serde_json::json!({
         "msg_type": "command_response",
         "target_id": target_id,
@@ -640,10 +735,7 @@ fn send_hardening_status(
             "error": error,
         }
     });
-    // Inviato via canale al writer task dedicato (flush affidabile e immediato).
-    out.try_send(Message::Text(msg.to_string()))
-        .map_err(|e| anyhow::anyhow!("channel chiuso: {e}"))?;
-    Ok(())
+    Message::Text(msg.to_string())
 }
 
 async fn execute_command(cmd: &CommandPayload) -> (bool, Option<String>, Option<String>) {
@@ -658,5 +750,61 @@ async fn execute_command(cmd: &CommandPayload) -> (bool, Option<String>, Option<
             warn!("Comando CyberShepherd non supportato: {}", other);
             (false, None, Some(format!("Azione non supportata: {other}")))
         }
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    fn text(s: &str) -> Message {
+        Message::Text(s.to_string())
+    }
+
+    #[test]
+    fn best_effort_scarta_a_coda_piena_senza_errore() {
+        let (out, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        assert!(send_best_effort(&out, text("a"), "t", "x").unwrap());
+        // Coda piena: scartato, ma la sessione non deve cadere.
+        assert!(!send_best_effort(&out, text("b"), "t", "x").unwrap());
+    }
+
+    #[test]
+    fn best_effort_errore_a_writer_chiuso() {
+        let (out, rx) = tokio::sync::mpsc::channel::<Message>(1);
+        drop(rx);
+        assert!(send_best_effort(&out, text("a"), "t", "x").is_err());
+    }
+
+    #[tokio::test]
+    async fn reliable_attende_il_posto_invece_di_scartare() {
+        // Regressione (seconda review, 2026-11): con try_send l'esito finale
+        // di un hardening andava perso se la coda era piena in quell'istante.
+        let (out, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
+        out.try_send(text("riempitivo")).unwrap();
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let first = rx.recv().await.unwrap();
+            let second = rx.recv().await.unwrap();
+            (first, second)
+        });
+        send_reliable(&out, text("esito finale")).await.unwrap();
+        let (_, second) = drain.await.unwrap();
+        assert_eq!(second, text("esito finale"));
+    }
+
+    #[tokio::test]
+    async fn reliable_errore_se_la_coda_resta_piena() {
+        let (out, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        out.try_send(text("riempitivo")).unwrap();
+        let err = send_within(&out, text("x"), Duration::from_millis(50)).await.unwrap_err();
+        assert!(err.to_string().contains("coda WS piena"));
+    }
+
+    #[tokio::test]
+    async fn reliable_errore_a_writer_chiuso() {
+        let (out, rx) = tokio::sync::mpsc::channel::<Message>(1);
+        drop(rx);
+        assert!(send_reliable(&out, text("x")).await.is_err());
     }
 }
