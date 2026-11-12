@@ -65,37 +65,46 @@ impl FirewallManager {
         validate_fw_word("action", &p.action)?;
         if let Some(ref v) = p.protocol { validate_fw_word("protocol", v)?; }
         if let Some(ref v) = p.interface { validate_fw_word("interface", v)?; }
-        if let Some(ref v) = p.src_ip { validate_fw_ip(v)?; }
-        if let Some(ref v) = p.dst_ip { validate_fw_ip(v)?; }
+        let src = p.src_ip.as_deref().map(parse_fw_ip).transpose()?;
+        let dst = p.dst_ip.as_deref().map(parse_fw_ip).transpose()?;
+        // Regola IPv6 → ip6tables. Senza IP resta iptables (comportamento storico).
+        let family = match (src, dst) {
+            (Some(a), Some(b)) if a != b => {
+                anyhow::bail!("src_ip e dst_ip di famiglie diverse (IPv4/IPv6)")
+            }
+            (Some(f), _) | (_, Some(f)) => f,
+            (None, None) => IpFamily::V4,
+        };
         // Costruisce args come vettore di token: Command::args li passa intatti
         // al processo (no shell, no split su whitespace). I commenti con spazi
         // restano un singolo argomento.
-        let mut args: Vec<String> = vec!["-A".into(), p.chain.clone()];
-        args.extend(build_rule_args(p));
-
-        run_iptables(&args)?;
-
-        let pretty = args
+        let spec = build_rule_args(p);
+        let pretty = spec
             .iter()
             .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
             .collect::<Vec<_>>()
             .join(" ");
+
+        if !append_once(family, &p.chain, &spec)? {
+            info!("Regola già presente: {} -A {} {}", family.bin(), p.chain, pretty);
+            return Ok(format!("Regola già presente: {} -A {} {pretty}", family.bin(), p.chain));
+        }
         self.lock_state().active_rules.push(RuleRecord {
             chain: p.chain.clone(),
             rule_spec: pretty.clone(),
         });
 
-        info!("Regola aggiunta: iptables {}", pretty);
-        Ok(format!("Regola aggiunta: iptables {pretty}"))
+        info!("Regola aggiunta: {} -A {} {}", family.bin(), p.chain, pretty);
+        Ok(format!("Regola aggiunta: {} -A {} {pretty}", family.bin(), p.chain))
     }
 
     pub fn remove_rule(&self, p: &RemoveRulePayload) -> Result<String> {
         validate_fw_word("chain", &p.chain)?;
         if let Some(ref v) = p.protocol { validate_fw_word("protocol", v)?; }
-        if let Some(ref v) = p.src_ip { validate_fw_ip(v)?; }
+        let family = p.src_ip.as_deref().map(parse_fw_ip).transpose()?.unwrap_or(IpFamily::V4);
         if let Some(ref v) = p.action { validate_fw_word("action", v)?; }
         if let Some(n) = p.rule_num {
-            run_iptables(&["-D".to_string(), p.chain.clone(), n.to_string()])?;
+            run_fw(family, &["-D".to_string(), p.chain.clone(), n.to_string()])?;
             info!("Regola rimossa: -D {} {}", p.chain, n);
             return Ok(format!("Regola rimossa: -D {} {}", p.chain, n));
         }
@@ -115,13 +124,11 @@ impl FirewallManager {
             args.extend(["-j".to_string(), action.clone()]);
         }
 
-        run_iptables(&args)?;
+        run_fw(family, &args)?;
 
         // Rimuovi dalla lista interna se presente
         let spec = args[2..].join(" ");
-        self.state
-            .lock()
-            .unwrap()
+        self.lock_state()
             .active_rules
             .retain(|r| r.chain != p.chain || r.rule_spec != spec);
 
@@ -130,28 +137,32 @@ impl FirewallManager {
     }
 
     pub fn block_ip(&self, ip: &str, direction: &str) -> Result<String> {
-        validate_fw_ip(ip)?;
+        let family = parse_fw_ip(ip)?;
         match direction.to_uppercase().as_str() {
             "BOTH" => {
-                run_iptables(&["-A".to_string(), "INPUT".to_string(), "-s".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()])?;
-                run_iptables(&["-A".to_string(), "OUTPUT".to_string(), "-d".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()])?;
+                append_once(family, "INPUT", &drop_spec("-s", ip))?;
+                append_once(family, "OUTPUT", &drop_spec("-d", ip))?;
             }
             "OUTPUT" => {
-                run_iptables(&["-A".to_string(), "OUTPUT".to_string(), "-d".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()])?;
+                append_once(family, "OUTPUT", &drop_spec("-d", ip))?;
             }
             _ => {
                 // default: INPUT
-                run_iptables(&["-A".to_string(), "INPUT".to_string(), "-s".to_string(), ip.to_string(), "-j".to_string(), "DROP".to_string()])?;
+                append_once(family, "INPUT", &drop_spec("-s", ip))?;
             }
         }
 
-        self.lock_state().blocked_ips.push(ip.to_string());
+        let mut state = self.lock_state();
+        if !state.blocked_ips.iter().any(|b| b == ip) {
+            state.blocked_ips.push(ip.to_string());
+        }
+        drop(state);
         info!("IP bloccato: {} ({})", ip, direction);
         Ok(format!("IP {ip} bloccato ({direction})"))
     }
 
     pub fn unblock_ip(&self, ip: &str, direction: &str) -> Result<String> {
-        validate_fw_ip(ip)?;
+        let family = parse_fw_ip(ip)?;
         // "BOTH" tenta la rimozione in entrambe le direzioni best-effort
         // (non si sa sempre quale fosse stata usata al momento del blocco,
         // e un retry idempotente su una regola già assente non deve essere
@@ -173,7 +184,7 @@ impl FirewallManager {
 
         let mut failures: Vec<String> = Vec::new();
         for args in &specs {
-            if let Err(e) = run_iptables(args) {
+            if let Err(e) = run_fw(family, args) {
                 warn!("unblock_ip: rimozione regola fallita ({}): {}", args.join(" "), e);
                 failures.push(e.to_string());
             }
@@ -243,15 +254,73 @@ fn validate_fw_word(kind: &str, v: &str) -> Result<()> {
     Ok(())
 }
 
-/// IP o CIDR: cifre, esadecimali IPv6, `.`, `:`, `/`. Mai leading `-`.
-fn validate_fw_ip(v: &str) -> Result<()> {
-    if v.is_empty()
-        || v.starts_with('-')
-        || !v.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '/'))
-    {
-        anyhow::bail!("indirizzo IP/CIDR non valido: {v:?}");
+/// Famiglia di indirizzi di una regola: decide se usare iptables o ip6tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    fn bin(self) -> &'static str {
+        match self {
+            IpFamily::V4 => "iptables",
+            IpFamily::V6 => "ip6tables",
+        }
     }
-    Ok(())
+}
+
+/// IP o CIDR (`10.0.0.1`, `192.168.0.0/16`, `fe80::1`, `2001:db8::/32`),
+/// verificato col parser di std e con il prefisso nel range della famiglia.
+/// Prima era solo un controllo sui caratteri: un IPv6 finiva comunque a
+/// `iptables`, che lo rifiuta (o peggio, in caso di regole miste).
+fn parse_fw_ip(v: &str) -> Result<IpFamily> {
+    let invalid = || anyhow::anyhow!("indirizzo IP/CIDR non valido: {v:?}");
+    let (addr, prefix) = match v.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (v, None),
+    };
+    let ip: std::net::IpAddr = addr.parse().map_err(|_| invalid())?;
+    let (family, max) = if ip.is_ipv4() { (IpFamily::V4, 32) } else { (IpFamily::V6, 128) };
+    if let Some(p) = prefix {
+        let n: u8 = p.parse().map_err(|_| invalid())?;
+        if n > max {
+            return Err(invalid());
+        }
+    }
+    Ok(family)
+}
+
+#[cfg(test)]
+fn validate_fw_ip(v: &str) -> Result<()> {
+    parse_fw_ip(v).map(|_| ())
+}
+
+fn drop_spec(flag: &str, ip: &str) -> Vec<String> {
+    vec![flag.into(), ip.into(), "-j".into(), "DROP".into()]
+}
+
+/// `-A chain spec` solo se `-C chain spec` dice che la regola non c'è già:
+/// prima ogni blocco ripetuto (stesso IP, reconnect, auto-block) aggiungeva
+/// una regola DROP duplicata. `Ok(false)` se era già presente.
+fn append_once(family: IpFamily, chain: &str, spec: &[String]) -> Result<bool> {
+    let with = |op: &str| {
+        let mut a = vec![op.to_string(), chain.to_string()];
+        a.extend_from_slice(spec);
+        a
+    };
+    if run_fw(family, &with("-C")).is_ok() {
+        return Ok(false);
+    }
+    run_fw(family, &with("-A"))?;
+    Ok(true)
+}
+
+/// DROP in INPUT dal sorgente `ip`, idempotente; usato anche dall'auto-block
+/// del threat detector. `Ok(false)` se il blocco c'era già.
+pub fn drop_input_from(ip: &str) -> Result<bool> {
+    let family = parse_fw_ip(ip)?;
+    append_once(family, "INPUT", &drop_spec("-s", ip))
 }
 
 /// Costruisce gli argomenti iptables in formato vettoriale. Command::args li
@@ -303,24 +372,25 @@ fn build_rule_args(p: &AddRulePayload) -> Vec<String> {
     args
 }
 
-fn run_iptables(args: &[String]) -> Result<()> {
+fn run_fw(family: IpFamily, args: &[String]) -> Result<()> {
+    let bin = family.bin();
     #[cfg(not(target_os = "linux"))]
     {
-        warn!("iptables non disponibile su questo sistema operativo");
+        warn!("{bin} non disponibile su questo sistema operativo ({})", args.join(" "));
         return Ok(());
     }
 
     #[cfg(target_os = "linux")]
     {
-        debug!("iptables {}", args.join(" "));
+        debug!("{bin} {}", args.join(" "));
 
-        let output = std::process::Command::new("iptables")
+        let output = std::process::Command::new(bin)
             .args(args)
             .output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("iptables fallito: {}", stderr.trim());
+            anyhow::bail!("{bin} fallito: {}", stderr.trim());
         }
 
         Ok(())
@@ -329,7 +399,16 @@ fn run_iptables(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_fw_ip, validate_fw_word};
+    use super::{parse_fw_ip, validate_fw_ip, validate_fw_word, IpFamily};
+
+    #[test]
+    fn fw_ip_sceglie_la_famiglia_e_valida_il_prefisso() {
+        assert_eq!(parse_fw_ip("10.0.0.1").unwrap(), IpFamily::V4);
+        assert_eq!(parse_fw_ip("2001:db8::/32").unwrap(), IpFamily::V6);
+        for v in ["10.0.0.0/33", "fe80::/129", "300.1.1.1", "1.2.3", "::ffff::1", "10.0.0.0/"] {
+            assert!(parse_fw_ip(v).is_err(), "{v:?} doveva essere rifiutato");
+        }
+    }
 
     #[test]
     fn fw_word_accetta_valori_legittimi() {

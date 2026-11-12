@@ -59,14 +59,18 @@ async fn session(config: &TargetConfig) -> Result<()> {
 
     // ── Setup ─────────────────────────────────────────────────────────────────
     let fw = FirewallManager::new();
-    let mut threat_detector = ThreatDetector::new(ThreatScoringConfig {
-        auto_block_threshold: config.threat_threshold,
-        auto_block_enabled: config.auto_block_threats,
-        bruteforce_min_attempts: config.bruteforce_min_attempts,
-        bruteforce_score_per_attempt: config.bruteforce_score_per_attempt,
-        synflood_min_connections: config.synflood_min_connections,
-        synflood_score_per_conn: config.synflood_score_per_conn,
-    });
+    let never_block = never_block_ips(config).await;
+    let mut threat_detector = ThreatDetector::new(
+        ThreatScoringConfig {
+            auto_block_threshold: config.threat_threshold,
+            auto_block_enabled: config.auto_block_threats,
+            bruteforce_min_attempts: config.bruteforce_min_attempts,
+            bruteforce_score_per_attempt: config.bruteforce_score_per_attempt,
+            synflood_min_connections: config.synflood_min_connections,
+            synflood_score_per_conn: config.synflood_score_per_conn,
+        },
+        never_block,
+    );
 
     let mut hb_timer = interval(Duration::from_secs(config.heartbeat_interval));
     hb_timer.tick().await; // salta il tick immediato
@@ -363,6 +367,42 @@ async fn execute_command(
             (CommandStatus::Failed, None, Some(e.to_string()))
         }
     }
+}
+
+/// IP che l'auto-block non deve mai bloccare: quelli del server FireDog
+/// (risolti dall'url del target) e l'IP configurato della macchina.
+async fn never_block_ips(config: &TargetConfig) -> Vec<std::net::IpAddr> {
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    if let Some(ip) = config.ip.as_deref().and_then(|s| s.parse().ok()) {
+        ips.push(ip);
+    }
+    if let Some(hp) = host_port(&config.ws_url()) {
+        match tokio::net::lookup_host(hp.as_str()).await {
+            Ok(addrs) => ips.extend(addrs.map(|a| a.ip())),
+            Err(e) => warn!("[{}] risoluzione di {hp} per la whitelist auto-block: {e}", config.name),
+        }
+    }
+    ips
+}
+
+/// `host:porta` da un URL ws(s)://, con la porta di default dello schema.
+fn host_port(url: &str) -> Option<String> {
+    let (rest, default_port) = if let Some(r) = url.strip_prefix("wss://") {
+        (r, 443)
+    } else {
+        (url.strip_prefix("ws://")?, 80)
+    };
+    let authority = rest.split('/').next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.is_empty() {
+        return None;
+    }
+    // "[::1]:8443", "[::1]", "host:8443", "host"
+    let has_port = match authority.rfind(']') {
+        Some(end) => authority[end..].contains(':'),
+        None => authority.contains(':'),
+    };
+    Some(if has_port { authority.to_string() } else { format!("{authority}:{default_port}") })
 }
 
 /// `requested` (dal server, via `CheckIntegrityPayload.paths`) è SOLO un
@@ -913,5 +953,19 @@ mod filter_integrity_paths_tests {
         let t = Tree::new("relativo");
         let configured = vec![t.p("allowed")];
         assert!(filter_integrity_paths(Some(vec!["allowed/file".into()]), &configured).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::host_port;
+
+    #[test]
+    fn porta_di_default_e_ipv6() {
+        assert_eq!(host_port("wss://fd.example.com/ws/agent/").as_deref(), Some("fd.example.com:443"));
+        assert_eq!(host_port("ws://10.0.0.5:8000/ws/agent/").as_deref(), Some("10.0.0.5:8000"));
+        assert_eq!(host_port("wss://[2001:db8::1]/ws/agent/").as_deref(), Some("[2001:db8::1]:443"));
+        assert_eq!(host_port("wss://[2001:db8::1]:8443/x").as_deref(), Some("[2001:db8::1]:8443"));
+        assert_eq!(host_port("http://x"), None);
     }
 }
