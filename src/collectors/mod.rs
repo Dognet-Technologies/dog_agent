@@ -7,6 +7,7 @@ pub mod users;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::config::TargetConfig;
 
@@ -54,23 +55,34 @@ pub async fn collect_all(config: &TargetConfig) -> Result<AllMetrics> {
     // dove possibile; quelli che dipendono da I/O bloccante usano
     // spawn_blocking internamente.
 
+    // Ogni fallimento viene loggato prima di scartarlo: senza questo, un
+    // problema di permessi o un panic transitorio in un collector faceva
+    // sparire silenziosamente quel campo dalle metriche per sempre, senza
+    // nulla nei log dell'agent che lo spiegasse (MEDIUM trovato in code
+    // review, 2026-11).
     let sys_fut = async {
-        if c.system { system::collect().await.ok() } else { None }
+        if !c.system { return None; }
+        system::collect().await.map_err(|e| warn!("collector system fallito: {e}")).ok()
     };
     let net_fut = async {
-        if c.network { network::collect().await.ok() } else { None }
+        if !c.network { return None; }
+        network::collect().await.map_err(|e| warn!("collector network fallito: {e}")).ok()
     };
     let usr_fut = async {
-        if c.users { users::collect().await.ok() } else { None }
+        if !c.users { return None; }
+        users::collect().await.map_err(|e| warn!("collector users fallito: {e}")).ok()
     };
     let fil_fut = async {
-        if c.files { files::collect().await.ok() } else { None }
+        if !c.files { return None; }
+        files::collect().await.map_err(|e| warn!("collector files fallito: {e}")).ok()
     };
     let svc_fut = async {
-        if c.services { services::collect().await.ok() } else { None }
+        if !c.services { return None; }
+        services::collect(c.docker).await.map_err(|e| warn!("collector services fallito: {e}")).ok()
     };
     let aud_fut = async {
-        if c.auditd { auditd::collect().await.ok() } else { None }
+        if !c.auditd { return None; }
+        auditd::collect().await.map_err(|e| warn!("collector auditd fallito: {e}")).ok()
     };
 
     let (system, network, users, files, services, auditd) =

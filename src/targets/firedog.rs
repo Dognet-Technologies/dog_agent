@@ -1,8 +1,8 @@
-/// Implementazione protocollo FireDog.
-///
-/// Lifecycle:
-///   connect → pair → [heartbeat loop + command handling + threat reporting]
-///   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
+//! Implementazione protocollo FireDog.
+//!
+//! Lifecycle:
+//!   connect → pair → [heartbeat loop + command handling + threat reporting]
+//!   Se la connessione cade: riconnessione a due livelli, vedi `reconnect.rs`.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -59,14 +59,18 @@ async fn session(config: &TargetConfig) -> Result<()> {
 
     // ── Setup ─────────────────────────────────────────────────────────────────
     let fw = FirewallManager::new();
-    let mut threat_detector = ThreatDetector::new(ThreatScoringConfig {
-        auto_block_threshold: config.threat_threshold,
-        auto_block_enabled: config.auto_block_threats,
-        bruteforce_min_attempts: config.bruteforce_min_attempts,
-        bruteforce_score_per_attempt: config.bruteforce_score_per_attempt,
-        synflood_min_connections: config.synflood_min_connections,
-        synflood_score_per_conn: config.synflood_score_per_conn,
-    });
+    let never_block = never_block_ips(config).await;
+    let mut threat_detector = ThreatDetector::new(
+        ThreatScoringConfig {
+            auto_block_threshold: config.threat_threshold,
+            auto_block_enabled: config.auto_block_threats,
+            bruteforce_min_attempts: config.bruteforce_min_attempts,
+            bruteforce_score_per_attempt: config.bruteforce_score_per_attempt,
+            synflood_min_connections: config.synflood_min_connections,
+            synflood_score_per_conn: config.synflood_score_per_conn,
+        },
+        never_block,
+    );
 
     let mut hb_timer = interval(Duration::from_secs(config.heartbeat_interval));
     hb_timer.tick().await; // salta il tick immediato
@@ -241,8 +245,32 @@ where
         }
         ServerMessage::Command { command_id, action, payload } => {
             info!("[{}] Comando ricevuto: {:?}", config.name, action);
-            let (status, output, error) =
-                execute_command(config, fw, &command_id, action, payload).await;
+            // Tetto assoluto sull'intero dispatch: un comando che si blocca
+            // (es. check_integrity su un path enorme/non terminante) non
+            // deve più bloccare per sempre questa sessione — niente più
+            // heartbeat/threat-report/reconnect per il target finché il
+            // processo non viene ucciso a mano (HIGH trovato in code
+            // review, 2026-11).
+            const COMMAND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(90);
+            let (status, output, error) = match tokio::time::timeout(
+                COMMAND_DISPATCH_TIMEOUT,
+                execute_command(config, fw, &command_id, action, payload),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    error!(
+                        "[{}] Comando {} oltre il timeout di {:?}, abortito",
+                        config.name, command_id, COMMAND_DISPATCH_TIMEOUT
+                    );
+                    (
+                        CommandStatus::Failed,
+                        None,
+                        Some(format!("timeout dispatch dopo {COMMAND_DISPATCH_TIMEOUT:?}")),
+                    )
+                }
+            };
 
             let resp = AgentMessage::CommandResponse {
                 command_id,
@@ -275,56 +303,27 @@ async fn execute_command(
     action: CommandAction,
     payload: serde_json::Value,
 ) -> (CommandStatus, Option<String>, Option<String>) {
-    let result = match action {
-        CommandAction::AddRule => {
-            match serde_json::from_value::<AddRulePayload>(payload) {
-                Ok(p) => fw.add_rule(&p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
-            }
-        }
-        CommandAction::RemoveRule => {
-            match serde_json::from_value::<RemoveRulePayload>(payload) {
-                Ok(p) => fw.remove_rule(&p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
-            }
-        }
-        CommandAction::BlockIp => {
-            match serde_json::from_value::<BlockIpPayload>(payload) {
-                Ok(p) => fw.block_ip(&p.ip, &p.direction),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
-            }
-        }
-        CommandAction::UnblockIp => {
-            match serde_json::from_value::<BlockIpPayload>(payload) {
-                Ok(p) => fw.unblock_ip(&p.ip, &p.direction),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
-            }
-        }
-        CommandAction::SyncRules => {
-            fw.sync_rules()
-        }
-        CommandAction::CheckIntegrity => {
-            let paths = match serde_json::from_value::<CheckIntegrityPayload>(payload) {
-                Ok(p) => p.paths.unwrap_or_else(|| config.integrity_paths.clone()),
-                Err(_) => config.integrity_paths.clone(),
-            };
-            run_integrity_check(&paths).await
-        }
-        CommandAction::UpdateConfig => {
-            match serde_json::from_value::<ThreatConfigUpdatePayload>(payload) {
-                Ok(p) => update_threat_config(config, &p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
-            }
-        }
-        CommandAction::UpdatePcapConfig => {
-            match serde_json::from_value::<PcapConfigUpdatePayload>(payload) {
-                Ok(p) => update_pcap_config(&p),
-                Err(e) => Err(anyhow::anyhow!("Payload non valido: {}", e)),
-            }
-        }
-        CommandAction::Unknown => {
-            Err(anyhow::anyhow!("Azione non riconosciuta"))
-        }
+    let result = if matches!(action, CommandAction::CheckIntegrity) {
+        // `paths` richiesti dal server sono SOLO un filtro, non possono
+        // ampliare l'insieme configurato localmente in integrity_paths:
+        // altrimenti il server potrebbe usare questo comando come
+        // oracolo di lettura (hash/size/mtime) su qualunque file del
+        // filesystem (CRITICAL trovato in code review, 2026-11).
+        let requested = serde_json::from_value::<CheckIntegrityPayload>(payload)
+            .ok()
+            .and_then(|p| p.paths);
+        let paths = filter_integrity_paths(requested, &config.integrity_paths);
+        run_integrity_check(&paths).await
+    } else {
+        // Il resto (iptables, firewall-manager, scrittura config) è
+        // bloccante: eseguito qui direttamente occupava il thread del
+        // runtime e il timeout di dispatch non poteva mai scattare (scatta
+        // solo a un .await). In spawn_blocking il timeout libera la
+        // sessione; il processo figlio eventualmente bloccato resta loggato.
+        let (cfg, fw) = (config.clone(), fw.clone());
+        tokio::task::spawn_blocking(move || execute_blocking(&cfg, &fw, action, payload))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("task del comando terminato: {e}")))
     };
 
     match result {
@@ -333,6 +332,147 @@ async fn execute_command(
             error!("[{}] Comando {} fallito: {}", config.name, command_id, e);
             (CommandStatus::Failed, None, Some(e.to_string()))
         }
+    }
+}
+
+/// Comandi FireDog sincroni (tutti tranne check_integrity).
+fn execute_blocking(
+    config: &TargetConfig,
+    fw: &FirewallManager,
+    action: CommandAction,
+    payload: serde_json::Value,
+) -> Result<String> {
+    match action {
+        CommandAction::AddRule => {
+            match serde_json::from_value::<AddRulePayload>(payload) {
+                Ok(p) => fw.add_rule(&p),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
+            }
+        }
+        CommandAction::RemoveRule => {
+            match serde_json::from_value::<RemoveRulePayload>(payload) {
+                Ok(p) => fw.remove_rule(&p),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
+            }
+        }
+        CommandAction::BlockIp => {
+            match serde_json::from_value::<BlockIpPayload>(payload) {
+                Ok(p) => fw.block_ip(&p.ip, &p.direction),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
+            }
+        }
+        CommandAction::UnblockIp => {
+            match serde_json::from_value::<BlockIpPayload>(payload) {
+                Ok(p) => fw.unblock_ip(&p.ip, &p.direction),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
+            }
+        }
+        CommandAction::SyncRules => {
+            fw.sync_rules()
+        }
+        CommandAction::CheckIntegrity => {
+            Err(anyhow::anyhow!("check_integrity gestito in execute_command"))
+        }
+        CommandAction::UpdateConfig => {
+            match serde_json::from_value::<ThreatConfigUpdatePayload>(payload) {
+                Ok(p) => update_threat_config(config, &p),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
+            }
+        }
+        CommandAction::UpdatePcapConfig => {
+            match serde_json::from_value::<PcapConfigUpdatePayload>(payload) {
+                Ok(p) => update_pcap_config(&p),
+                Err(e) => Err(anyhow::anyhow!("Payload non valido: {e}")),
+            }
+        }
+        CommandAction::Unknown => {
+            Err(anyhow::anyhow!("Azione non riconosciuta"))
+        }
+    }
+}
+
+/// IP che l'auto-block non deve mai bloccare: quelli del server FireDog
+/// (risolti dall'url del target) e l'IP configurato della macchina.
+async fn never_block_ips(config: &TargetConfig) -> Vec<std::net::IpAddr> {
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    if let Some(ip) = config.ip.as_deref().and_then(|s| s.parse().ok()) {
+        ips.push(ip);
+    }
+    if let Some(hp) = host_port(&config.ws_url()) {
+        match tokio::net::lookup_host(hp.as_str()).await {
+            Ok(addrs) => ips.extend(addrs.map(|a| a.ip())),
+            Err(e) => warn!("[{}] risoluzione di {hp} per la whitelist auto-block: {e}", config.name),
+        }
+    }
+    ips
+}
+
+/// `host:porta` da un URL ws(s)://, con la porta di default dello schema.
+fn host_port(url: &str) -> Option<String> {
+    let (rest, default_port) = if let Some(r) = url.strip_prefix("wss://") {
+        (r, 443)
+    } else {
+        (url.strip_prefix("ws://")?, 80)
+    };
+    let authority = rest.split('/').next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.is_empty() {
+        return None;
+    }
+    // "[::1]:8443", "[::1]", "host:8443", "host"
+    let has_port = match authority.rfind(']') {
+        Some(end) => authority[end..].contains(':'),
+        None => authority.contains(':'),
+    };
+    Some(if has_port { authority.to_string() } else { format!("{authority}:{default_port}") })
+}
+
+/// `requested` (dal server, via `CheckIntegrityPayload.paths`) è SOLO un
+/// filtro sull'insieme configurato localmente in `integrity_paths` — non può
+/// mai ampliarlo. Senza questo, il server potrebbe usare `check_integrity`
+/// come oracolo di lettura (hash/size/mtime) su qualunque file del
+/// filesystem (CRITICAL trovato in code review, 2026-11).
+///
+/// Il confronto NON è sulla stringa: `/etc/../root/.ssh` inizia con `/etc/`
+/// ma il kernel lo risolve in `/root/.ssh`, e un symlink sotto una root
+/// configurata (es. `/var/www/x -> /root`) porta fuori allo stesso modo.
+/// Si scartano quindi i path con componenti `..` e si confrontano per
+/// componenti i path canonicalizzati (symlink risolti); al walk passa il
+/// path canonico, non quello richiesto. Un path inesistente viene scartato:
+/// non c'è nulla da hashare.
+fn filter_integrity_paths(requested: Option<Vec<String>>, configured: &[String]) -> Vec<String> {
+    let Some(requested) = requested else {
+        return configured.to_vec();
+    };
+    let allowed_roots: Vec<std::path::PathBuf> = configured
+        .iter()
+        .filter_map(|c| std::fs::canonicalize(c).ok())
+        .collect();
+    requested
+        .into_iter()
+        .filter_map(|r| resolve_within(&r, &allowed_roots))
+        .collect()
+}
+
+/// Path canonico di `requested` se è assoluto, senza componenti `..` e,
+/// a symlink risolti, dentro una delle `allowed_roots` (già canonicalizzate).
+fn resolve_within(requested: &str, allowed_roots: &[std::path::PathBuf]) -> Option<String> {
+    use std::path::{Component, Path};
+    let path = Path::new(requested);
+    let lexically_clean = path.is_absolute()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !lexically_clean {
+        warn!("check_integrity: path '{requested}' rifiutato (non assoluto o con ..)");
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+        canonical.to_str().map(str::to_owned)
+    } else {
+        warn!("check_integrity: path '{requested}' fuori da integrity_paths, ignorato");
+        None
     }
 }
 
@@ -438,7 +578,7 @@ fn update_target_config_file(
             let mut name_matches = false;
             while j < lines.len() && !lines[j].trim_start().starts_with("[[targets]]") {
                 let trimmed = lines[j].trim_start();
-                if trimmed.starts_with("name") && trimmed.contains(&format!("\"{}\"", target_name)) {
+                if trimmed.starts_with("name") && trimmed.contains(&format!("\"{target_name}\"")) {
                     name_matches = true;
                 }
                 j += 1;
@@ -458,27 +598,81 @@ fn update_target_config_file(
         anyhow::anyhow!("Blocco [[targets]] '{}' non trovato in {}", target_name, path.display())
     })?;
 
-    let mut remaining: Vec<&str> = updates.iter().map(|(k, _)| *k).collect();
+    // `matched` è popolato controllando `updates` direttamente (non una
+    // lista derivata separata che potrebbe divergere): un `.unwrap()` qui
+    // dipendeva da un invariante non documentato tra due liste — una
+    // futura modifica indipendente dell'una o dell'altra lo avrebbe reso
+    // un panic raggiungibile da un messaggio del server (HIGH trovato in
+    // code review, 2026-11; vedi anche la mancanza di supervisione sui
+    // panic dei target, corretta separatamente in targets/mod.rs).
+    let mut matched: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for line in &mut lines[block_start..block_end] {
         let trimmed = line.trim_start().to_string();
         for (key, value) in updates {
             if let Some(rest) = trimmed.strip_prefix(key) {
                 if rest.trim_start().starts_with('=') {
-                    *line = format!("{} = {}", key, value);
-                    remaining.retain(|k| k != key);
+                    *line = format!("{key} = {value}");
+                    matched.insert(key);
                 }
             }
         }
     }
-    for key in remaining {
-        let value = &updates.iter().find(|(k, _)| *k == key).unwrap().1;
-        lines.insert(block_end, format!("{} = {}", key, value));
-        block_end += 1;
+    for (key, value) in updates {
+        if !matched.contains(key) {
+            lines.insert(block_end, format!("{key} = {value}"));
+            block_end += 1;
+        }
     }
 
-    std::fs::write(path, lines.join("\n") + "\n")
+    // agent.conf contiene l'api_key: 0600 se per qualche motivo non ha già
+    // permessi propri da conservare.
+    write_atomic(path, &(lines.join("\n") + "\n"), 0o600)
         .with_context(|| format!("Impossibile scrivere {}", path.display()))?;
     Ok(())
+}
+
+/// Scrittura atomica: file temporaneo nella stessa directory, con permessi
+/// e proprietario dell'originale (`default_mode` se non esiste), fsync,
+/// rename. Prima `std::fs::write` troncava e riscriveva sul posto: un crash
+/// o un disco pieno a metà lasciava agent.conf vuoto o troncato, e l'agent
+/// non ripartiva più.
+fn write_atomic(path: &std::path::Path, content: &str, default_mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let existing = std::fs::metadata(path).ok();
+    let mode = existing.as_ref().map_or(default_mode, |m| m.mode() & 0o7777);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path senza nome file: {}", path.display()))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
+
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        if let Some(m) = &existing {
+            // Best-effort: senza privilegi il chown a un altro gruppo
+            // fallisce, e non è un motivo per non aggiornare la config.
+            if let Err(e) = std::os::unix::fs::fchown(&f, Some(m.uid()), Some(m.gid())) {
+                warn!("{}: proprietario originale non ripristinato: {e}", path.display());
+            }
+        }
+        f.write_all(content.as_bytes())?;
+        f.sync_all()
+    })();
+    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(Into::into)
 }
 
 /// Path del file letto da `firewall-manager.py`/`traffic-analyzer.py`
@@ -521,11 +715,12 @@ const VALID_THREAT_COMMAND_KEYS: [&str; 5] =
 fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
     if let Some(ref tool) = p.pcap_analysis_tool {
         if tool != "tcpdump" && tool != "tshark" {
-            anyhow::bail!("pcap_analysis_tool non valido: '{}' (atteso tcpdump|tshark)", tool);
+            anyhow::bail!("pcap_analysis_tool non valido: '{tool}' (atteso tcpdump|tshark)");
         }
     }
     if let Some(ref save_path) = p.pcap_save_path {
         reject_unsafe_conf_value("pcap_save_path", save_path)?;
+        validate_pcap_save_path(save_path)?;
     }
     if let Some(ref filters) = p.pcap_custom_filters {
         for f in filters {
@@ -535,7 +730,7 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
     if let Some(ref commands) = p.pcap_threat_commands {
         for c in commands {
             if !VALID_THREAT_COMMAND_KEYS.contains(&c.as_str()) {
-                anyhow::bail!("pcap_threat_commands: chiave sconosciuta '{}'", c);
+                anyhow::bail!("pcap_threat_commands: chiave sconosciuta '{c}'");
             }
         }
     }
@@ -572,10 +767,10 @@ fn update_pcap_config(p: &PcapConfigUpdatePayload) -> Result<String> {
         anyhow::bail!("Nessun campo da aggiornare nel payload");
     }
 
-    std::fs::write(path, lines.join("\n") + "\n")
+    write_atomic(path, &(lines.join("\n") + "\n"), 0o644)
         .with_context(|| format!("Impossibile scrivere {}", path.display()))?;
 
-    Ok(format!("Config pcap aggiornata ({} campi)", changed))
+    Ok(format!("Config pcap aggiornata ({changed} campi)"))
 }
 
 /// Racchiude `value` tra apici singoli, escapando gli apici letterali
@@ -599,12 +794,31 @@ fn bash_single_quote(value: &str) -> String {
 /// esplicitamente (errore chiaro all'admin) che silenziosamente disallineare
 /// i due lati. Un newline romperebbe comunque il formato una-riga-per-chiave
 /// a prescindere dal quoting.
+/// PCAP_SAVE_PATH è usato come root da firewall-manager.py/traffic-analyzer.py
+/// per leggere e scrivere catture: deve essere assoluto, senza `..` e fuori
+/// dalle directory di sistema. Default FireDog: /var/log/ulogd.
+fn validate_pcap_save_path(value: &str) -> Result<()> {
+    use std::path::{Component, Path};
+    const SYSTEM_TREES: &[&str] = &[
+        "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/boot",
+        "/root", "/proc", "/sys", "/dev", "/run",
+    ];
+    let p = Path::new(value);
+    if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+        anyhow::bail!("pcap_save_path deve essere un path assoluto senza '..': {value:?}");
+    }
+    if p.parent().is_none() || SYSTEM_TREES.iter().any(|t| p.starts_with(t)) {
+        anyhow::bail!("pcap_save_path non può stare in una directory di sistema: {value:?}");
+    }
+    Ok(())
+}
+
 fn reject_unsafe_conf_value(field: &str, value: &str) -> Result<()> {
     if value.contains('\'') {
-        anyhow::bail!("{}: non può contenere l'apice singolo (')", field);
+        anyhow::bail!("{field}: non può contenere l'apice singolo (')");
     }
     if value.contains('\n') || value.contains('\r') {
-        anyhow::bail!("{}: non può contenere newline", field);
+        anyhow::bail!("{field}: non può contenere newline");
     }
     Ok(())
 }
@@ -624,12 +838,12 @@ fn upsert_conf_line(lines: &mut Vec<String>, key: &str, value: &str) {
         }
         if let Some(rest) = trimmed.strip_prefix(key) {
             if rest.starts_with('=') {
-                *line = format!("{}={}", key, quoted);
+                *line = format!("{key}={quoted}");
                 return;
             }
         }
     }
-    lines.push(format!("{}={}", key, quoted));
+    lines.push(format!("{key}={quoted}"));
 }
 
 /// Rimuove tutte le righe (non-commento) la cui chiave inizia con `prefix` —
@@ -678,4 +892,206 @@ where
     info!("[{}] firewall_stats inviato (snapshot mtime={:?})", config.name, mtime);
     *last_mtime = Some(mtime);
     Ok(())
+}
+
+#[cfg(test)]
+mod update_target_config_file_tests {
+    use super::update_target_config_file;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_toml(content: &str) -> std::path::PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "dog-agent-test-config-{}-{}.toml",
+            std::process::id(),
+            seq
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn aggiorna_chiave_esistente_e_aggiunge_chiave_assente() {
+        let path = tmp_toml(
+            "[[targets]]\nname = \"t1\"\nthreat_threshold = 75\n[[targets]]\nname = \"t2\"\n",
+        );
+        let updates = vec![
+            ("threat_threshold", "90".to_string()),
+            ("bruteforce_min_attempts", "12".to_string()),
+        ];
+        update_target_config_file(&path, "t1", &updates).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(out.contains("threat_threshold = 90"));
+        assert!(out.contains("bruteforce_min_attempts = 12"));
+        // Il blocco del secondo target non deve essere toccato.
+        assert!(out.contains("name = \"t2\""));
+        // La nuova chiave va aggiunta DENTRO il blocco di t1, non dopo t2.
+        let t1_pos = out.find("name = \"t1\"").unwrap();
+        let t2_pos = out.find("name = \"t2\"").unwrap();
+        let new_key_pos = out.find("bruteforce_min_attempts").unwrap();
+        assert!(t1_pos < new_key_pos && new_key_pos < t2_pos);
+    }
+
+    #[test]
+    fn blocco_non_trovato_e_un_errore_non_un_panic() {
+        let path = tmp_toml("[[targets]]\nname = \"t1\"\n");
+        let err = update_target_config_file(&path, "non-esiste", &[("x", "1".to_string())])
+            .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains("non trovato"));
+    }
+}
+
+#[cfg(test)]
+mod filter_integrity_paths_tests {
+    use super::filter_integrity_paths;
+    use std::path::PathBuf;
+
+    /// Albero temporaneo: <base>/allowed/{file,sub/} e <base>/secret/key,
+    /// più un symlink <base>/allowed/escape -> <base>/secret.
+    struct Tree {
+        base: PathBuf,
+    }
+
+    impl Tree {
+        fn new(tag: &str) -> Self {
+            let base = std::env::temp_dir()
+                .join(format!("dog-agent-integrity-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("allowed/sub")).unwrap();
+            std::fs::create_dir_all(base.join("secret")).unwrap();
+            std::fs::write(base.join("allowed/file"), b"x").unwrap();
+            std::fs::write(base.join("secret/key"), b"k").unwrap();
+            std::os::unix::fs::symlink(base.join("secret"), base.join("allowed/escape")).unwrap();
+            let base = std::fs::canonicalize(&base).unwrap();
+            Tree { base }
+        }
+        fn p(&self, rel: &str) -> String {
+            self.base.join(rel).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn nessuna_richiesta_usa_tutto_il_configurato() {
+        let configured = vec!["/etc".to_string(), "/usr/bin".to_string()];
+        assert_eq!(filter_integrity_paths(None, &configured), configured);
+    }
+
+    #[test]
+    fn richiesta_fuori_dal_configurato_e_scartata() {
+        // Regressione: il server non deve poter usare check_integrity come
+        // oracolo di lettura su un path arbitrario fuori da quanto già
+        // configurato localmente. Un sottopercorso di una root GIA'
+        // configurata non è invece una nuova esposizione.
+        let t = Tree::new("fuori");
+        let configured = vec![t.p("allowed")];
+        let requested = vec![t.p("allowed/sub"), t.p("secret"), "/dev/zero".to_string()];
+        let out = filter_integrity_paths(Some(requested), &configured);
+        assert_eq!(out, vec![t.p("allowed/sub")]);
+    }
+
+    #[test]
+    fn richiesta_esattamente_uguale_a_un_path_configurato_e_accettata() {
+        let t = Tree::new("uguale");
+        let configured = vec![t.p("allowed")];
+        let out = filter_integrity_paths(Some(vec![t.p("allowed")]), &configured);
+        assert_eq!(out, vec![t.p("allowed")]);
+    }
+
+    #[test]
+    fn prefisso_senza_separatore_non_basta() {
+        // "<base>/allowedfoo" non è un sottopercorso di "<base>/allowed".
+        let t = Tree::new("prefisso");
+        std::fs::create_dir_all(t.base.join("allowedfoo")).unwrap();
+        let configured = vec![t.p("allowed")];
+        let out = filter_integrity_paths(Some(vec![t.p("allowedfoo")]), &configured);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dot_dot_non_esce_dalla_root_configurata() {
+        // Regressione (seconda review, 2026-11): il confronto per stringa
+        // accettava "<allowed>/../secret" perché inizia con "<allowed>/".
+        let t = Tree::new("dotdot");
+        let configured = vec![t.p("allowed")];
+        let requested = vec![t.p("allowed/../secret"), t.p("allowed/sub/../../secret/key")];
+        assert!(filter_integrity_paths(Some(requested), &configured).is_empty());
+    }
+
+    #[test]
+    fn symlink_sotto_la_root_non_porta_fuori() {
+        let t = Tree::new("symlink");
+        let configured = vec![t.p("allowed")];
+        let requested = vec![t.p("allowed/escape"), t.p("allowed/escape/key")];
+        assert!(filter_integrity_paths(Some(requested), &configured).is_empty());
+    }
+
+    #[test]
+    fn path_relativo_e_scartato() {
+        let t = Tree::new("relativo");
+        let configured = vec![t.p("allowed")];
+        assert!(filter_integrity_paths(Some(vec!["allowed/file".into()]), &configured).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::host_port;
+
+    #[test]
+    fn porta_di_default_e_ipv6() {
+        assert_eq!(host_port("wss://fd.example.com/ws/agent/").as_deref(), Some("fd.example.com:443"));
+        assert_eq!(host_port("ws://10.0.0.5:8000/ws/agent/").as_deref(), Some("10.0.0.5:8000"));
+        assert_eq!(host_port("wss://[2001:db8::1]/ws/agent/").as_deref(), Some("[2001:db8::1]:443"));
+        assert_eq!(host_port("wss://[2001:db8::1]:8443/x").as_deref(), Some("[2001:db8::1]:8443"));
+        assert_eq!(host_port("http://x"), None);
+    }
+}
+
+#[cfg(test)]
+mod conf_write_tests {
+    use super::{validate_pcap_save_path, write_atomic};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn pcap_save_path_fuori_dalle_directory_di_sistema() {
+        for ok in ["/var/log/ulogd", "/var/log/ulogd/input_dropped.pcap", "/data/pcap"] {
+            assert!(validate_pcap_save_path(ok).is_ok(), "{ok} doveva essere accettato");
+        }
+        for bad in ["/", "var/log", "/var/log/../../etc/cron.d/x", "/etc/cron.d/x", "/usr/bin/x", "/root/p"] {
+            assert!(validate_pcap_save_path(bad).is_err(), "{bad} doveva essere rifiutato");
+        }
+    }
+
+    #[test]
+    fn write_atomic_conserva_i_permessi_e_non_lascia_temporanei() {
+        let dir = std::env::temp_dir().join(format!("dog-agent-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("agent.conf");
+        std::fs::write(&conf, "vecchio\n").unwrap();
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomic(&conf, "nuovo\n", 0o600).unwrap();
+        let mode = std::fs::metadata(&conf).unwrap().permissions().mode() & 0o777;
+        let content = std::fs::read_to_string(&conf).unwrap();
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+
+        write_atomic(&dir.join("nuovo.conf"), "x", 0o600).unwrap();
+        let new_mode = std::fs::metadata(dir.join("nuovo.conf")).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((mode, content.as_str(), entries), (0o640, "nuovo\n", 1));
+        assert_eq!(new_mode, 0o600);
+    }
 }

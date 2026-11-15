@@ -8,6 +8,18 @@
 # Livello di log: debug | info | warn | error
 log_level = "info"
 
+# Certificato (PEM) della Root CA Dognet con cui sono firmati i certificati
+# dei master. Se impostato, l'agent verifica il certificato del server contro
+# questa CA su wss:// (nessun MITM) — modalità consigliata.
+# ca_cert = "/etc/dog-agent/dognet-ca.pem"
+
+# Senza ca_cert, l'agent si RIFIUTA di avviarsi su un target wss:// (non
+# ricade più silenziosamente su una connessione non verificata). Per
+# accettare comunque certificati self-signed senza verifica — SOLO in LAN
+# fidata, nessuna protezione da MITM attivo, solo come misura transitoria
+# prima di configurare ca_cert — scommentare:
+# allow_insecure_tls = true
+
 # ─────────────────────────────────────────────────────────────
 # ESEMPIO: Target FireDog
 # ─────────────────────────────────────────────────────────────

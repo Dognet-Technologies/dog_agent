@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod collectors;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_new(format!("dog_agent={}", log_level))
+            EnvFilter::try_new(format!("dog_agent={log_level}"))
                 .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
@@ -66,6 +66,22 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Inizializza la verifica TLS (Root CA Dognet se configurata, verifier
+    // permissivo solo con allow_insecure_tls). Una volta, prima di aprire
+    // connessioni; se la CA configurata non si carica l'agent NON parte.
+    if config.targets.iter().any(|t| t.ws_url().starts_with("wss://")) {
+        if let Err(e) = ws::init_tls(
+            config.agent.ca_cert.as_deref(),
+            config.agent.allow_insecure_tls,
+        ) {
+            error!("{e:#}");
+            std::process::exit(1);
+        }
+    }
+
+    // L'api_key è in chiaro nel file di config: avvisa se è leggibile da altri.
+    warn_if_config_insecure(&args.config);
+
     // Avvia un task tokio per ogni target
     let mut handles = Vec::new();
     for mut target in config.targets {
@@ -75,6 +91,12 @@ async fn main() -> Result<()> {
             "[{}] ambiente configurato: {}",
             name, target.environment
         );
+        if target.ws_url().starts_with("ws://") {
+            warn!(
+                "[{}] endpoint in chiaro (ws://): l'api_key e i dati viaggiano non cifrati. Usa wss://.",
+                name
+            );
+        }
         let handle = tokio::spawn(async move {
             spawn_target(target).await;
         });
@@ -120,3 +142,25 @@ async fn shutdown_signal() {
         ctrl_c.await;
     }
 }
+
+/// Avvisa se il file di config — che contiene l'api_key in chiaro — è
+/// accessibile a gruppo o altri utenti. Consigliato 0600.
+#[cfg(unix)]
+fn warn_if_config_insecure(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            warn!(
+                "Il file di config {} ha permessi {:o} e contiene l'api_key in chiaro: \
+                 restringilo a 0600 (chmod 600 {}).",
+                path.display(),
+                mode,
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_config_insecure(_path: &std::path::Path) {}

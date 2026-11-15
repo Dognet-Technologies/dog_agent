@@ -33,19 +33,25 @@ pub async fn collect() -> Result<FilesMetrics> {
     collect_paths(&paths).await
 }
 
+/// Tempo massimo di un check_integrity: sotto il timeout di dispatch (90s)
+/// del comando, così il walk si ferma da solo invece di continuare in un
+/// thread bloccante dopo che il comando è già stato dato per fallito.
+const INTEGRITY_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(75);
+
 /// Verifica integrità su percorsi specifici (usata da comando check_integrity)
 pub async fn check_integrity(paths: &[String]) -> Result<Vec<FileHash>> {
     let paths_owned = paths.to_vec();
-    tokio::task::spawn_blocking(move || hash_paths(&paths_owned))
+    let deadline = std::time::Instant::now() + INTEGRITY_CHECK_BUDGET;
+    tokio::task::spawn_blocking(move || hash_paths_until(&paths_owned, Some(deadline)))
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 async fn collect_paths(paths: &[String]) -> Result<FilesMetrics> {
     let paths_owned = paths.to_vec();
     tokio::task::spawn_blocking(move || collect_sync(&paths_owned))
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 fn collect_sync(paths: &[String]) -> Result<FilesMetrics> {
@@ -65,6 +71,12 @@ fn collect_sync(paths: &[String]) -> Result<FilesMetrics> {
 }
 
 fn hash_paths(paths: &[String]) -> Result<Vec<FileHash>> {
+    hash_paths_until(paths, None)
+}
+
+/// Come `hash_paths`, ma oltre `deadline` si ferma con un errore invece di
+/// continuare a girare in un thread bloccante.
+fn hash_paths_until(paths: &[String], deadline: Option<std::time::Instant>) -> Result<Vec<FileHash>> {
     let mut hashes = Vec::new();
 
     for base in paths {
@@ -75,6 +87,13 @@ fn hash_paths(paths: &[String]) -> Result<Vec<FileHash>> {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                anyhow::bail!(
+                    "check_integrity interrotto dopo {:?}: {} file verificati",
+                    INTEGRITY_CHECK_BUDGET,
+                    hashes.len()
+                );
+            }
             let path = entry.path();
             if let Ok(hash) = hash_file(path) {
                 hashes.push(hash);
@@ -85,12 +104,28 @@ fn hash_paths(paths: &[String]) -> Result<Vec<FileHash>> {
     Ok(hashes)
 }
 
+/// Cap di dimensione prima di leggere un file interamente in memoria per
+/// l'hash — senza questo, un path puntato su un file enorme (o un
+/// "file" speciale che non termina mai la lettura) poteva bloccare/esaurire
+/// la memoria del thread bloccante (HIGH trovato in code review, 2026-11).
+const MAX_HASH_FILE_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
 fn hash_file(path: &Path) -> Result<FileHash> {
     let meta = std::fs::metadata(path)?;
-    let data = std::fs::read(path)?;
-
+    if meta.len() > MAX_HASH_FILE_SIZE_BYTES {
+        anyhow::bail!(
+            "file {} troppo grande per l'hash ({} byte > {} byte)",
+            path.display(),
+            meta.len(),
+            MAX_HASH_FILE_SIZE_BYTES
+        );
+    }
+    // Hash a blocchi: prima il file (fino a 100 MiB) veniva letto tutto in
+    // memoria, per ogni file del walk.
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
     let mut hasher = Sha512::new();
-    hasher.update(&data);
+    std::io::copy(&mut file.take(MAX_HASH_FILE_SIZE_BYTES), &mut hasher)?;
     let digest = hex::encode(hasher.finalize());
 
     let modified_at = meta

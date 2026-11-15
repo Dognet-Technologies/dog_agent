@@ -23,34 +23,57 @@ pub struct SecurityAuditOutcome {
 /// restituisce i risultati grezzi. Non applica mai `--remediate`.
 pub fn run_security_audit(modules: &str) -> SecurityAuditOutcome {
     if !Path::new(AUDIT_SCRIPT).exists() {
-        return unavailable(format!("{} non trovato sul target", AUDIT_SCRIPT));
+        return unavailable(format!("{AUDIT_SCRIPT} non trovato sul target"));
     }
     if !python3_available() {
         return unavailable("python3 non disponibile sul target".to_string());
     }
 
-    let out_path = format!("/tmp/security-audit-{}.json", std::process::id());
+    // Directory privata per-call (uuid, 0700): il path deve essere univoco
+    // tra scansioni concorrenti di target diversi E non prevedibile — prima
+    // era /tmp/security-audit-{pid}-{seq}.json, su cui un utente locale
+    // poteva piazzare un symlink o un JSON falso letto poi come risultato
+    // dell'audit (HIGH, seconda review 2026-11).
+    let dir = match super::hardening::create_private_tmp_dir("security-audit") {
+        Ok(d) => d,
+        Err(e) => return failed(format!("creazione directory temporanea: {e}")),
+    };
+    let out_path = dir.join("audit.json").to_string_lossy().into_owned();
+    let outcome = run_in_dir(modules, &out_path);
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+fn run_in_dir(modules: &str, out_path: &str) -> SecurityAuditOutcome {
     let cmd = format!(
         "python3 {} -m {} -f JSON -o {} -q --no-cache",
         AUDIT_SCRIPT,
         shell_quote(modules),
-        shell_quote(&out_path)
+        shell_quote(out_path)
     );
 
-    let (code, _output, timed_out) = super::hardening::run_shell(&cmd, AUDIT_TIMEOUT_SECS);
+    let (code, output, timed_out) = super::hardening::run_shell(&cmd, AUDIT_TIMEOUT_SECS);
     if timed_out {
         return failed("timeout durante l'esecuzione del security audit".to_string());
     }
+    // Un exit non-zero non deve far fidare del file di output: potrebbe
+    // essere assente, parziale o una vecchia scansione mai pulita — prima
+    // di questo fix il codice di uscita non veniva controllato affatto.
+    if code != 0 {
+        return failed(format!(
+            "script terminato con exit {code}: {}",
+            output.lines().last().unwrap_or("(nessun output)")
+        ));
+    }
 
-    let raw = match std::fs::read_to_string(&out_path) {
+    let raw = match std::fs::read_to_string(out_path) {
         Ok(s) => s,
-        Err(e) => return failed(format!("lettura output fallita (exit {}): {}", code, e)),
+        Err(e) => return failed(format!("lettura output fallita (exit {code}): {e}")),
     };
-    let _ = std::fs::remove_file(&out_path);
 
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
-        Err(e) => return failed(format!("JSON non valido: {}", e)),
+        Err(e) => return failed(format!("JSON non valido: {e}")),
     };
 
     let results: Vec<Value> = parsed
