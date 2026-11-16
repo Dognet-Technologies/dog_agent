@@ -29,6 +29,10 @@ RuntimeDirectory=dog-agent
 RuntimeDirectoryMode=0755
 LogsDirectory=dog-agent
 LogsDirectoryMode=0755
+# Stato persistente (posizione di lettura del log di Laurel): sopravvive a
+# riconnessioni e riavvii, così l'agent non rispedisce eventi già inviati.
+StateDirectory=dog-agent
+StateDirectoryMode=0750
 # /var/log/dog-agent e /run/dog-agent sono già scrivibili via
 # LogsDirectory/RuntimeDirectory (whitelisting automatico di systemd).
 # /run/xtables.lock deve ESISTERE prima dell'avvio o il mount namespace

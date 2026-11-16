@@ -1,4 +1,5 @@
 mod cybershepherd;
+mod laurel_cursor;
 mod firedog;
 pub(crate) mod hardening;
 mod security_audit;

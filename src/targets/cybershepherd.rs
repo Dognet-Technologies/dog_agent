@@ -18,6 +18,7 @@ use crate::compression::compress_json;
 use crate::config::TargetConfig;
 use crate::protocol::cybershepherd::*;
 use crate::reconnect::Reconnect;
+use super::laurel_cursor;
 
 /// Coda verso il writer task della sessione.
 type Out = tokio::sync::mpsc::Sender<Message>;
@@ -131,7 +132,10 @@ async fn session(config: &TargetConfig, long_cmds: &Arc<Semaphore>) -> Result<()
     send_timer.tick().await;
 
     let mut buffer: Vec<AllMetrics> = Vec::new();
-    let mut laurel_offset: u64 = 0;
+    // Posizione nel log di Laurel: ricaricata dal disco a ogni sessione, così
+    // una riconnessione non rispedisce gli eventi già inviati (laurel_cursor.rs).
+    let laurel_state = laurel_cursor::state_file(std::path::Path::new(laurel_cursor::STATE_DIR), &config.name);
+    let mut laurel_pos = laurel_cursor::load(&laurel_state);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -168,17 +172,27 @@ async fn session(config: &TargetConfig, long_cmds: &Arc<Semaphore>) -> Result<()
                 }
                 // Inoltro eventi Laurel (se configurato laurel_log_path)
                 if let Some(path) = config.laurel_log_path.clone() {
-                    let off = laurel_offset;
-                    match tokio::task::spawn_blocking(move || read_laurel_events(&path, off)).await {
-                        Ok((events, new_off)) => {
-                            // L'offset avanza solo a invio riuscito: in caso
-                            // di errore la sessione cade e gli eventi non
-                            // risultano letti.
+                    let saved = laurel_pos;
+                    let read = tokio::task::spawn_blocking(move || {
+                        laurel_cursor::read_complete_lines(std::path::Path::new(&path), saved)
+                    })
+                    .await;
+                    match read {
+                        Ok(Ok((events, new_pos))) => {
+                            // La posizione avanza (e si salva) solo a invio
+                            // riuscito: in caso di errore la sessione cade e
+                            // gli eventi restano da inviare.
                             if !events.is_empty() {
                                 flush_security_events(config, &out, events, target_id).await?;
                             }
-                            laurel_offset = new_off;
+                            if laurel_pos != Some(new_pos) {
+                                laurel_pos = Some(new_pos);
+                                if let Err(e) = laurel_cursor::save(&laurel_state, new_pos) {
+                                    warn!("[{}] Posizione Laurel non salvata ({}): {}", config.name, laurel_state.display(), e);
+                                }
+                            }
                         }
+                        Ok(Err(e)) => debug!("[{}] Log Laurel non leggibile: {}", config.name, e),
                         Err(e) => error!("[{}] Errore lettura Laurel: {}", config.name, e),
                     }
                 }
@@ -381,43 +395,6 @@ async fn flush_security_events(
         payload: compressed,
     };
     send_reliable(out, Message::Text(serde_json::to_string(&msg)?)).await
-}
-
-/// Tail del file JSON di Laurel: legge le righe nuove da `offset`, ne fa il
-/// parse (una riga = un evento arricchito) e restituisce `(eventi, nuovo_offset)`.
-/// Gestisce la rotazione (se il file è più corto di `offset`, riparte da 0).
-/// Funzione bloccante: eseguirla in `spawn_blocking`.
-fn read_laurel_events(path: &str, offset: u64) -> (Vec<serde_json::Value>, u64) {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
-
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (Vec::new(), offset),
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let start = if len < offset { 0 } else { offset };
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return (Vec::new(), offset);
-    }
-
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-    let mut pos = start;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        pos += line.len() as u64 + 1; // +1 per il newline
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            events.push(v);
-        }
-    }
-    (events, pos)
 }
 
 async fn handle_server_message(
