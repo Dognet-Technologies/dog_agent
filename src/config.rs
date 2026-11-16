@@ -23,10 +23,11 @@ pub struct AgentSettings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// Certificato (PEM) della Root CA Dognet con cui sono firmati i certificati
-    /// dei master. Se impostato, l'agent verifica il certificato del server
-    /// contro questa CA su `wss://` (nessun MITM). Se assente, l'agent si
-    /// rifiuta di avviarsi su un target `wss://` — vedi `allow_insecure_tls`.
+    /// File PEM con le CA dei master (una per installazione: CyberShepherd
+    /// 0.37+, FireDog 1.5.1+; più CA nello stesso file se l'agent parla con
+    /// più master). Su `wss://` il certificato del server è verificato contro
+    /// queste CA (nessun MITM). Se assente, l'agent si rifiuta di avviarsi su
+    /// un target `wss://` — vedi `allow_insecure_tls` e docs/MANUALE.md.
     #[serde(default)]
     pub ca_cert: Option<PathBuf>,
 
@@ -226,11 +227,9 @@ impl TargetConfig {
     /// Restituisce l'URL WebSocket completo per il sistema configurato
     /// `url` in agent.conf può essere `ws://`, `wss://`, `http://` o
     /// `https://` — questi ultimi due normalizzati sullo scheme WS
-    /// equivalente. Per `wss://`, la connessione (vedi `crate::ws::connect`)
-    /// accetta certificati self-signed senza pinning: stessa fiducia già
-    /// accettata lato browser per lo stesso certificato del master, non
-    /// protegge da un MITM attivo. Aggiornare qui SE in futuro si aggiunge
-    /// pinning (fingerprint del cert salvato al pairing).
+    /// equivalente. Per `wss://` il certificato del master è verificato
+    /// contro `agent.ca_cert` (vedi `crate::ws`); solo con l'opt-in
+    /// `allow_insecure_tls` è accettato senza verifica.
     pub fn ws_url(&self) -> String {
         let base = self
             .url

@@ -85,17 +85,17 @@ impl FirewallManager {
             .collect::<Vec<_>>()
             .join(" ");
 
-        if !append_once(family, &p.chain, &spec)? {
-            info!("Regola già presente: {} -A {} {}", family.bin(), p.chain, pretty);
-            return Ok(format!("Regola già presente: {} -A {} {pretty}", family.bin(), p.chain));
+        if !add_once(family, &p.chain, &spec, Placement::BeforeFinalDrop)? {
+            info!("Regola già presente: {} {} {}", family.bin(), p.chain, pretty);
+            return Ok(format!("Regola già presente: {} {} {pretty}", family.bin(), p.chain));
         }
         self.lock_state().active_rules.push(RuleRecord {
             chain: p.chain.clone(),
             rule_spec: pretty.clone(),
         });
 
-        info!("Regola aggiunta: {} -A {} {}", family.bin(), p.chain, pretty);
-        Ok(format!("Regola aggiunta: {} -A {} {pretty}", family.bin(), p.chain))
+        info!("Regola aggiunta: {} {} {}", family.bin(), p.chain, pretty);
+        Ok(format!("Regola aggiunta: {} {} {pretty}", family.bin(), p.chain))
     }
 
     pub fn remove_rule(&self, p: &RemoveRulePayload) -> Result<String> {
@@ -140,15 +140,15 @@ impl FirewallManager {
         let family = parse_fw_ip(ip)?;
         match direction.to_uppercase().as_str() {
             "BOTH" => {
-                append_once(family, "INPUT", &drop_spec("-s", ip))?;
-                append_once(family, "OUTPUT", &drop_spec("-d", ip))?;
+                add_once(family, "INPUT", &drop_spec("-s", ip), Placement::Top)?;
+                add_once(family, "OUTPUT", &drop_spec("-d", ip), Placement::Top)?;
             }
             "OUTPUT" => {
-                append_once(family, "OUTPUT", &drop_spec("-d", ip))?;
+                add_once(family, "OUTPUT", &drop_spec("-d", ip), Placement::Top)?;
             }
             _ => {
                 // default: INPUT
-                append_once(family, "INPUT", &drop_spec("-s", ip))?;
+                add_once(family, "INPUT", &drop_spec("-s", ip), Placement::Top)?;
             }
         }
 
@@ -300,27 +300,76 @@ fn drop_spec(flag: &str, ip: &str) -> Vec<String> {
     vec![flag.into(), ip.into(), "-j".into(), "DROP".into()]
 }
 
-/// `-A chain spec` solo se `-C chain spec` dice che la regola non c'è già:
-/// prima ogni blocco ripetuto (stesso IP, reconnect, auto-block) aggiungeva
-/// una regola DROP duplicata. `Ok(false)` se era già presente.
-fn append_once(family: IpFamily, chain: &str, spec: &[String]) -> Result<bool> {
-    let with = |op: &str| {
+/// Dove mettere una regola nella catena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// In cima (`-I chain 1`): i blocchi devono valere su tutto, anche sulle
+    /// connessioni già stabilite e su SSH accettato più in basso.
+    Top,
+    /// Prima dello scarto finale della catena, se c'è (vedi
+    /// `before_final_drop`), altrimenti in fondo.
+    BeforeFinalDrop,
+}
+
+/// Aggiunge la regola solo se `-C chain spec` dice che non c'è già: prima
+/// ogni blocco ripetuto (stesso IP, reconnect, auto-block) aggiungeva una
+/// regola DROP duplicata. `Ok(false)` se era già presente.
+///
+/// Prima si usava sempre `-A` (in fondo). Sui target con firewall-manager la
+/// catena INPUT finisce con `-j LOG_INPUT_DROP`, che scarta tutto ciò che
+/// arriva fin lì: un DROP accodato dopo non fermava il traffico già accettato
+/// più in alto (SSH sotto la soglia di SSH_PROTECT, porte sempre aperte,
+/// connessioni stabilite) e un ACCEPT accodato non veniva mai raggiunto
+/// (review 2026-11-16).
+fn add_once(family: IpFamily, chain: &str, spec: &[String], placement: Placement) -> Result<bool> {
+    let with = |op: &str, pos: Option<usize>| {
         let mut a = vec![op.to_string(), chain.to_string()];
+        if let Some(n) = pos {
+            a.push(n.to_string());
+        }
         a.extend_from_slice(spec);
         a
     };
-    if run_fw(family, &with("-C")).is_ok() {
+    if run_fw(family, &with("-C", None)).is_ok() {
         return Ok(false);
     }
-    run_fw(family, &with("-A"))?;
+    let position = match placement {
+        Placement::Top => Some(1),
+        Placement::BeforeFinalDrop => before_final_drop(&chain_rules(family, chain)?, chain),
+    };
+    match position {
+        Some(n) => run_fw(family, &with("-I", Some(n)))?,
+        None => run_fw(family, &with("-A", None))?,
+    }
     Ok(true)
+}
+
+/// Regole della catena come le stampa `iptables -S <chain>`.
+fn chain_rules(family: IpFamily, chain: &str) -> Result<Vec<String>> {
+    let out = run_fw_output(family, &["-S".to_string(), chain.to_string()])?;
+    Ok(out.lines().map(str::to_string).collect())
+}
+
+/// Posizione (1-based, per `-I`) dell'ultima regola se è uno scarto senza
+/// condizioni (`-A CHAIN -j DROP|REJECT|LOG_*_DROP`), cioè il "tutto il
+/// resto si scarta" di firewall-manager: la regola nuova va subito prima,
+/// dopo le protezioni ma ancora raggiungibile. `None` se la catena non
+/// finisce così (nessun firewall-manager): si accoda in fondo.
+fn before_final_drop(rules: &[String], chain: &str) -> Option<usize> {
+    let prefix = format!("-A {chain} ");
+    let appended: Vec<&str> = rules.iter().map(String::as_str).filter(|r| r.starts_with(&prefix)).collect();
+    let last = appended.last()?;
+    let target = last.strip_prefix(&prefix)?.strip_prefix("-j ")?.trim();
+    let is_final_drop = !target.contains(' ')
+        && (target == "DROP" || target == "REJECT" || (target.starts_with("LOG_") && target.ends_with("_DROP")));
+    is_final_drop.then_some(appended.len())
 }
 
 /// DROP in INPUT dal sorgente `ip`, idempotente; usato anche dall'auto-block
 /// del threat detector. `Ok(false)` se il blocco c'era già.
 pub fn drop_input_from(ip: &str) -> Result<bool> {
     let family = parse_fw_ip(ip)?;
-    append_once(family, "INPUT", &drop_spec("-s", ip))
+    add_once(family, "INPUT", &drop_spec("-s", ip), Placement::Top)
 }
 
 /// Costruisce gli argomenti iptables in formato vettoriale. Command::args li
@@ -372,6 +421,26 @@ fn build_rule_args(p: &AddRulePayload) -> Vec<String> {
     args
 }
 
+/// Come `run_fw`, restituendo lo stdout (es. `iptables -S`).
+fn run_fw_output(family: IpFamily, args: &[String]) -> Result<String> {
+    let bin = family.bin();
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!("{bin} non disponibile su questo sistema operativo ({})", args.join(" "));
+        return Ok(String::new());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new(bin).args(args).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("{bin} fallito: {}", stderr.trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
 fn run_fw(family: IpFamily, args: &[String]) -> Result<()> {
     let bin = family.bin();
     #[cfg(not(target_os = "linux"))]
@@ -399,7 +468,42 @@ fn run_fw(family: IpFamily, args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fw_ip, validate_fw_ip, validate_fw_word, IpFamily};
+    use super::{before_final_drop, parse_fw_ip, validate_fw_ip, validate_fw_word, IpFamily};
+
+    fn rules(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn regole_prima_dello_scarto_finale_di_firewall_manager() {
+        // `iptables -S INPUT` reale di lab-client1 (firewall-manager), accorciato.
+        let input = rules(&[
+            "-P INPUT DROP",
+            "-A INPUT -i lo -j ACCEPT",
+            "-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+            "-A INPUT -p tcp -m tcp --dport 22 -m conntrack --ctstate NEW -j SSH_PROTECT",
+            "-A INPUT -p tcp -m tcp --dport 9000 -m conntrack --ctstate NEW -j ACCEPT",
+            "-A INPUT -j LOG_INPUT_DROP",
+        ]);
+        // 5 regole, l'ultima è lo scarto: la nuova va in posizione 5.
+        assert_eq!(before_final_drop(&input, "INPUT"), Some(5));
+        let output = rules(&["-P OUTPUT DROP", "-A OUTPUT -o lo -j ACCEPT", "-A OUTPUT -j LOG_OUTPUT_DROP"]);
+        assert_eq!(before_final_drop(&output, "OUTPUT"), Some(2));
+        assert_eq!(before_final_drop(&rules(&["-P INPUT ACCEPT", "-A INPUT -j DROP"]), "INPUT"), Some(1));
+    }
+
+    #[test]
+    fn senza_scarto_finale_si_accoda() {
+        // Nessun firewall-manager: policy ACCEPT, catena vuota o con regole normali.
+        assert_eq!(before_final_drop(&rules(&["-P INPUT ACCEPT"]), "INPUT"), None);
+        let input = rules(&["-P INPUT ACCEPT", "-A INPUT -s 203.0.113.5/32 -j DROP"]);
+        assert_eq!(before_final_drop(&input, "INPUT"), None, "un DROP con condizioni non è lo scarto finale");
+        let input = rules(&["-P INPUT DROP", "-A INPUT -j SSH_PROTECT"]);
+        assert_eq!(before_final_drop(&input, "INPUT"), None, "un salto a una catena qualsiasi non scarta tutto");
+        // Righe di altre catene non contano.
+        let mixed = rules(&["-A FORWARD -j DROP", "-A INPUT -i lo -j ACCEPT"]);
+        assert_eq!(before_final_drop(&mixed, "INPUT"), None);
+    }
 
     #[test]
     fn fw_ip_sceglie_la_famiglia_e_valida_il_prefisso() {
