@@ -100,7 +100,7 @@ certificato server da solo e l'agent non va toccato.
    `-k` serve solo per questo primo download: subito dopo verifichi tu.
 2. **Confronta l'impronta** con quella mostrata nel master (FireDog:
    Impostazioni > API Keys Agent > "Certificato del master"; CyberShepherd:
-   Impostazioni > Agent pairing). Devono coincidere carattere per carattere:
+   Impostazioni > Agent pairing e API key). Devono coincidere carattere per carattere:
    ```bash
    openssl x509 -in /tmp/firedog-ca.pem -noout -fingerprint -sha256
    ```
