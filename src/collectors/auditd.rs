@@ -28,7 +28,7 @@ pub struct SudoEvent {
 pub async fn collect() -> Result<AuditdMetrics> {
     tokio::task::spawn_blocking(collect_sync)
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
 }
 
 fn collect_sync() -> Result<AuditdMetrics> {

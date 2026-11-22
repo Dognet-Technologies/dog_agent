@@ -1,9 +1,9 @@
 [package]
 name = "dog-agent"
-version = "1.1.1"
+version = "1.3.1"
 edition = "2021"
 authors = ["Dognet Technologies"]
-description = "Unified agent for Dognet Suite (FireDog, CyberSheppard, SentinelCore)"
+description = "Unified agent for Dognet Suite (FireDog, CyberShepherd, SentinelCore)"
 license = "MIT"
 
 [[bin]]
@@ -14,15 +14,24 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# Verifier custom per accettare i certificati self-signed del master (LAN,
+# HTTPS di default) — stessa fiducia già accettata lato browser per lo stesso
+# certificato. Versione allineata a quella risolta transitivamente da
+# tokio-tungstenite (vedi Cargo.lock), non introduce un secondo rustls.
+rustls = { version = "0.22", default-features = false, features = ["ring"] }
+# Carica il PEM della Root CA Dognet (agent.ca_cert) per la verifica stretta
+# del certificato server. Pura Rust, compatibile col build musl statico.
+rustls-pemfile = "2"
 futures-util = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+regex = "1"
 
-# Compression (CyberSheppard)
-zstd = "0.13"
+# Compression (CyberShepherd)
+zstd = "0.13.4"
 
 # Hashing (file integrity)
 sha2 = "0.10"
@@ -66,7 +75,7 @@ maintainer = "Dognet Technologies <info@dognet.it>"
 copyright = "2024, Dognet Technologies"
 extended-description = """\
 Unified Dog Agent for the Dognet Suite.
-Supports FireDog, CyberSheppard and SentinelCore backends.
+Supports FireDog, CyberShepherd and SentinelCore backends.
 A single binary configured via /etc/dog-agent/agent.conf."""
 depends = "$auto"
 section = "net"
@@ -79,6 +88,14 @@ assets = [
     ["target/release/dog-agent", "usr/bin/", "755"],
     ["config.example.toml", "etc/dog-agent/agent.conf.example", "644"],
     ["debian/dog-agent.tmpfiles", "usr/lib/tmpfiles.d/dog-agent.conf", "644"],
+    # Linux-Security-Audit-Project vendorizzato (MIT, vedi THIRD_PARTY_LICENSES.md) —
+    # motore di scan usato dal comando agent `security_audit_scan`. Directory piatte
+    # (nessuna sottodirectory), un glob a livello singolo per ciascuna basta.
+    ["vendor/linux-security-audit/linux_security_audit.py", "opt/sentinelsuite/cybershepherd/linux-security-audit/", "644"],
+    ["vendor/linux-security-audit/LICENSE", "opt/sentinelsuite/cybershepherd/linux-security-audit/", "644"],
+    ["vendor/linux-security-audit/UPSTREAM_COMMIT.txt", "opt/sentinelsuite/cybershepherd/linux-security-audit/", "644"],
+    ["vendor/linux-security-audit/modules/*.py", "opt/sentinelsuite/cybershepherd/linux-security-audit/modules/", "644"],
+    ["vendor/linux-security-audit/shared_components/*.py", "opt/sentinelsuite/cybershepherd/linux-security-audit/shared_components/", "644"],
 ]
 conf-files = ["/etc/dog-agent/agent.conf"]
 maintainer-scripts = "debian/"
@@ -95,6 +112,11 @@ assets = [
     { source = "config.example.toml", dest = "/etc/dog-agent/agent.conf.example", mode = "644" },
     { source = "debian/dog-agent.service", dest = "/usr/lib/systemd/system/dog-agent.service", mode = "644" },
     { source = "debian/dog-agent.tmpfiles", dest = "/usr/lib/tmpfiles.d/dog-agent.conf", mode = "644" },
+    { source = "vendor/linux-security-audit/linux_security_audit.py", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/linux_security_audit.py", mode = "644" },
+    { source = "vendor/linux-security-audit/LICENSE", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/LICENSE", mode = "644" },
+    { source = "vendor/linux-security-audit/UPSTREAM_COMMIT.txt", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/UPSTREAM_COMMIT.txt", mode = "644" },
+    { source = "vendor/linux-security-audit/modules/*.py", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/modules/", mode = "644" },
+    { source = "vendor/linux-security-audit/shared_components/*.py", dest = "/opt/sentinelsuite/cybershepherd/linux-security-audit/shared_components/", mode = "644" },
 ]
 post_install_script = """
 #!/bin/sh

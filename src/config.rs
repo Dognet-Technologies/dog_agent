@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+fn default_config_path() -> PathBuf {
+    PathBuf::new()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Configurazione globale
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,12 +22,31 @@ pub struct Config {
 pub struct AgentSettings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// File PEM con le CA dei master (una per installazione: CyberShepherd
+    /// 0.37+, FireDog 1.5.1+; più CA nello stesso file se l'agent parla con
+    /// più master). Su `wss://` il certificato del server è verificato contro
+    /// queste CA (nessun MITM). Se assente, l'agent si rifiuta di avviarsi su
+    /// un target `wss://` — vedi `allow_insecure_tls` e docs/MANUALE.md.
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Opt-in esplicito per accettare certificati server self-signed SENZA
+    /// verificarli contro una CA (nessuna protezione da MITM attivo su
+    /// `wss://`). Default `false`: senza `ca_cert` e senza questo flag,
+    /// l'agent si rifiuta di avviarsi invece di ricadere silenziosamente su
+    /// una connessione non verificata. Da usare solo in LAN fidata, come
+    /// misura transitoria prima di configurare una vera CA.
+    #[serde(default)]
+    pub allow_insecure_tls: bool,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
             log_level: default_log_level(),
+            ca_cert: None,
+            allow_insecure_tls: false,
         }
     }
 }
@@ -40,7 +63,9 @@ fn default_log_level() -> String {
 #[serde(rename_all = "lowercase")]
 pub enum SystemType {
     Firedog,
-    Cybersheppard,
+    // Il vecchio nome resta valido: gli agent.conf gia' installati lo usano.
+    #[serde(alias = "cybersheppard")]
+    Cybershepherd,
     Sentinelcore,
 }
 
@@ -48,8 +73,40 @@ impl std::fmt::Display for SystemType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SystemType::Firedog => write!(f, "firedog"),
-            SystemType::Cybersheppard => write!(f, "cybersheppard"),
+            SystemType::Cybershepherd => write!(f, "cybershepherd"),
             SystemType::Sentinelcore => write!(f, "sentinelcore"),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ambiente del target (produzione / clone di test)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Ruolo di questo target nel ciclo di vita del deployment. Puramente
+/// informativo: non altera alcun comportamento dell'agent, nessun campo
+/// viene inviato ai backend. Serve a chi configura `linked_environments` su
+/// un device SentinelCore (vedi
+/// vulnerability-manager/migrations/159_device_linked_environments.sql) a
+/// sapere a colpo d'occhio, leggendo agent.conf del target, se questa
+/// istanza è il clone di testing/preproduzione o l'originale di produzione.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum AgentEnvironment {
+    #[default]
+    Production,
+    Testing,
+    Preproduction,
+}
+
+
+impl std::fmt::Display for AgentEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentEnvironment::Production => write!(f, "production"),
+            AgentEnvironment::Testing => write!(f, "testing"),
+            AgentEnvironment::Preproduction => write!(f, "preproduction"),
         }
     }
 }
@@ -95,13 +152,29 @@ pub struct TargetConfig {
     #[serde(default = "default_threat_threshold")]
     pub threat_threshold: u32,
 
+    /// Formula threat-score, configurabile (vedi src/threat/mod.rs). Default
+    /// pari alle costanti storiche pre-v1.1.0, TRANNE dove indicato: gli
+    /// utenti che aggiornano l'agent senza toccare agent.conf ereditano il
+    /// comportamento ricalibrato, non quello originale — i default originali
+    /// (5 tentativi/×10, 20 connessioni/×3) erano troppo aggressivi: un
+    /// admin che sbaglia la password SSH ~8 volte finiva già in auto-block
+    /// con threat_threshold=75.
+    #[serde(default = "default_bruteforce_min_attempts")]
+    pub bruteforce_min_attempts: u32,
+    #[serde(default = "default_bruteforce_score_per_attempt")]
+    pub bruteforce_score_per_attempt: u32,
+    #[serde(default = "default_synflood_min_connections")]
+    pub synflood_min_connections: u32,
+    #[serde(default = "default_synflood_score_per_conn")]
+    pub synflood_score_per_conn: u32,
+
     /// Path monitorati per integrità file
     #[serde(default)]
     pub integrity_paths: Vec<String>,
 
-    // ── CyberSheppard ─────────────────────────────────────────────────────────
+    // ── CyberShepherd ─────────────────────────────────────────────────────────
 
-    /// ID target assegnato dal backend CyberSheppard
+    /// ID target assegnato dal backend CyberShepherd
     pub target_id: Option<i32>,
 
     /// Intervallo raccolta metriche in secondi (default: 30)
@@ -120,19 +193,43 @@ pub struct TargetConfig {
     #[serde(default = "default_max_buffer_size")]
     pub max_buffer_size: usize,
 
-    /// Collector abilitati per CyberSheppard
+    /// Collector abilitati per CyberShepherd
     #[serde(default)]
     pub collectors: CollectorsConfig,
 
+    /// Percorso del file JSON prodotto da Laurel (plugin auditd) sul target.
+    /// Se impostato, l'agent lo tail-a e inoltra gli eventi arricchiti al server
+    /// come `SecurityEvents`. Se `None`, l'inoltro eventi è disattivato.
+    #[serde(default)]
+    pub laurel_log_path: Option<String>,
+
     // ── Condiviso ─────────────────────────────────────────────────────────────
+
+    /// Ruolo di questo target (production/testing/preproduction) — vedi
+    /// `AgentEnvironment`. Default: production.
+    #[serde(default)]
+    pub environment: AgentEnvironment,
 
     /// Impostazioni di reconnessione con backoff esponenziale
     #[serde(default)]
     pub reconnect: ReconnectConfig,
+
+    /// Path del file agent.conf da cui questo target è stato caricato — NON
+    /// letto dal TOML (`skip`), popolato da main.rs dopo `Config::load()`.
+    /// Serve a `CommandAction::UpdateConfig` (src/targets/firedog.rs) per
+    /// sapere quale file riscrivere quando il server pusha una nuova
+    /// configurazione threat-scoring.
+    #[serde(skip, default = "default_config_path")]
+    pub config_path: PathBuf,
 }
 
 impl TargetConfig {
     /// Restituisce l'URL WebSocket completo per il sistema configurato
+    /// `url` in agent.conf può essere `ws://`, `wss://`, `http://` o
+    /// `https://` — questi ultimi due normalizzati sullo scheme WS
+    /// equivalente. Per `wss://` il certificato del master è verificato
+    /// contro `agent.ca_cert` (vedi `crate::ws`); solo con l'opt-in
+    /// `allow_insecure_tls` è accettato senza verifica.
     pub fn ws_url(&self) -> String {
         let base = self
             .url
@@ -141,9 +238,9 @@ impl TargetConfig {
         let base = base.trim_end_matches('/');
 
         match self.system_type {
-            SystemType::Firedog => format!("{}/ws/agent/", base),
-            SystemType::Cybersheppard => format!("{}/api/agents/ws", base),
-            SystemType::Sentinelcore => format!("{}/ws/agent/", base),
+            SystemType::Firedog => format!("{base}/ws/agent/"),
+            SystemType::Cybershepherd => format!("{base}/api/agents/ws"),
+            SystemType::Sentinelcore => format!("{base}/ws/agent/"),
         }
     }
 
@@ -170,16 +267,28 @@ impl TargetConfig {
                     anyhow::bail!("Target '{}' (firedog): mac è obbligatorio", self.name);
                 }
             }
-            SystemType::Cybersheppard => {
-                if self.target_id.is_none() {
+            SystemType::Cybershepherd => {
+                // target_id è obbligatorio SOLO sul percorso legacy ad auth-token:
+                // col pairing per-identità (ip+hostname+mac tutti presenti) il
+                // target viene risolto lato server dall'identity_hash — vedi
+                // AgentMessage::PairRequest sopra ("target_id può essere 0,
+                // ignorato") e targets/cybershepherd.rs::use_pairing. Prima di
+                // questo fix la validazione lo richiedeva comunque, impedendo
+                // di configurare un target nuovo (nessun target_id noto finché
+                // non esiste ancora sul master) nonostante il pairing per
+                // identità non ne avesse bisogno — trovato dal vivo, 2026-11-08.
+                let has_identity = self.ip.as_deref().is_some_and(|v| !v.is_empty())
+                    && self.hostname.as_deref().is_some_and(|v| !v.is_empty())
+                    && self.mac.as_deref().is_some_and(|v| !v.is_empty());
+                if self.target_id.is_none() && !has_identity {
                     anyhow::bail!(
-                        "Target '{}' (cybersheppard): target_id è obbligatorio",
+                        "Target '{}' (cybershepherd): serve target_id oppure ip+hostname+mac (pairing per identità)",
                         self.name
                     );
                 }
                 if self.compression_level < 1 || self.compression_level > 22 {
                     anyhow::bail!(
-                        "Target '{}' (cybersheppard): compression_level deve essere 1-22",
+                        "Target '{}' (cybershepherd): compression_level deve essere 1-22",
                         self.name
                     );
                 }
@@ -194,7 +303,7 @@ impl TargetConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Collector config (CyberSheppard)
+// Collector config (CyberShepherd)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -235,20 +344,26 @@ impl Default for CollectorsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReconnectConfig {
-    #[serde(default = "default_initial_backoff")]
-    pub initial_backoff: u64,
-    #[serde(default = "default_max_backoff")]
-    pub max_backoff: u64,
-    #[serde(default = "default_backoff_multiplier")]
-    pub backoff_multiplier: f64,
+    /// Intervallo (secondi) tra i tentativi del livello veloce — usato subito
+    /// dopo un avvio o dopo una sessione stabile (vedi `reconnect.rs`).
+    #[serde(default = "default_fast_backoff_secs")]
+    pub fast_backoff_secs: u64,
+    /// Quanti tentativi al livello veloce prima di passare al livello lento.
+    #[serde(default = "default_fast_max_attempts")]
+    pub fast_max_attempts: u32,
+    /// Intervallo (secondi) tra i tentativi del livello lento, quando il
+    /// livello veloce si esaurisce senza riuscire a riconnettersi (server
+    /// presumibilmente giù per un periodo prolungato).
+    #[serde(default = "default_slow_backoff_secs")]
+    pub slow_backoff_secs: u64,
 }
 
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
-            initial_backoff: default_initial_backoff(),
-            max_backoff: default_max_backoff(),
-            backoff_multiplier: default_backoff_multiplier(),
+            fast_backoff_secs: default_fast_backoff_secs(),
+            fast_max_attempts: default_fast_max_attempts(),
+            slow_backoff_secs: default_slow_backoff_secs(),
         }
     }
 }
@@ -276,6 +391,18 @@ impl Config {
         for target in &self.targets {
             target.validate()?;
         }
+        if self.agent.ca_cert.is_none() && !self.agent.allow_insecure_tls {
+            if let Some(target) = self.targets.iter().find(|t| t.ws_url().starts_with("wss://")) {
+                anyhow::bail!(
+                    "Target '{}': endpoint wss:// senza [agent] ca_cert configurato. \
+                     Imposta [agent] ca_cert = \"/path/to/ca.pem\" per verificare il \
+                     certificato del server, oppure [agent] allow_insecure_tls = true per \
+                     accettare certificati self-signed senza verifica (SOLO in LAN fidata, \
+                     nessuna protezione da MITM attivo).",
+                    target.name
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -290,7 +417,120 @@ fn default_send_interval() -> u64 { 10 }
 fn default_compression_level() -> i32 { 3 }
 fn default_max_buffer_size() -> usize { 10 }
 fn default_threat_threshold() -> u32 { 75 }
-fn default_initial_backoff() -> u64 { 1 }
-fn default_max_backoff() -> u64 { 300 }
-fn default_backoff_multiplier() -> f64 { 2.0 }
+// Ricalibrati in v1.1.0 (meno aggressivi dei valori storici 5/×10, 20/×3 —
+// vedi commento su TargetConfig): 10 tentativi = score 70 (non ancora
+// auto-block), 15 = 100. 35 connessioni SYN_RECV = 70, 50 = 100.
+fn default_bruteforce_min_attempts() -> u32 { 10 }
+fn default_bruteforce_score_per_attempt() -> u32 { 7 }
+fn default_synflood_min_connections() -> u32 { 35 }
+fn default_synflood_score_per_conn() -> u32 { 2 }
+fn default_fast_backoff_secs() -> u64 { 5 }
+fn default_fast_max_attempts() -> u32 { 20 }
+fn default_slow_backoff_secs() -> u64 { 1800 }
 fn default_true() -> bool { true }
+
+#[cfg(test)]
+mod system_type_tests {
+    use super::SystemType;
+
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        system_type: SystemType,
+    }
+
+    fn parse(value: &str) -> SystemType {
+        toml::from_str::<Wrapper>(&format!("system_type = \"{value}\""))
+            .expect("system_type valido")
+            .system_type
+    }
+
+    #[test]
+    fn accepts_new_and_legacy_cybershepherd_names() {
+        assert_eq!(parse("cybershepherd"), SystemType::Cybershepherd);
+        assert_eq!(parse("cybersheppard"), SystemType::Cybershepherd);
+    }
+}
+
+#[cfg(test)]
+mod cybershepherd_validate_tests {
+    use super::TargetConfig;
+
+    fn target(extra: &str) -> TargetConfig {
+        toml::from_str(&format!(
+            "name = \"t\"\nsystem_type = \"cybershepherd\"\nurl = \"wss://x\"\napi_key = \"k\"\n{extra}"
+        ))
+        .expect("toml valido")
+    }
+
+    #[test]
+    fn valido_con_solo_target_id() {
+        assert!(target("target_id = 1").validate().is_ok());
+    }
+
+    // Regressione: prima del fix, un target configurato per il pairing per
+    // identità (senza target_id, non ancora noto finché il master non crea
+    // il target) veniva respinto da validate() pur essendo esattamente lo
+    // scenario che AgentMessage::PairRequest supporta ("target_id può essere
+    // 0, ignorato: il target è risolto per identità").
+    #[test]
+    fn valido_con_sola_identita_di_pairing_senza_target_id() {
+        let t = target("ip = \"10.10.0.18\"\nhostname = \"h\"\nmac = \"aa:bb:cc:dd:ee:ff\"");
+        assert!(t.target_id.is_none());
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn invalido_senza_target_id_ne_identita_completa() {
+        assert!(target("").validate().is_err());
+        // Identità parziale (manca mac) non basta neppure lei.
+        assert!(target("ip = \"10.10.0.18\"\nhostname = \"h\"").validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod tls_validate_tests {
+    use super::Config;
+
+    fn config(agent_extra: &str, url: &str) -> Config {
+        toml::from_str(&format!(
+            "[agent]\n{agent_extra}\n[[targets]]\nname = \"t\"\nsystem_type = \"firedog\"\nurl = \"{url}\"\napi_key = \"k\"\nip = \"10.0.0.1\"\nhostname = \"h\"\nmac = \"aa:bb:cc:dd:ee:ff\"\n"
+        ))
+        .expect("toml valido")
+    }
+
+    // Regressione: senza ca_cert e senza allow_insecure_tls, un target wss://
+    // non deve più ricadere silenziosamente su una connessione TLS non
+    // verificata (CRITICAL trovato in code review, 2026-11).
+    #[test]
+    fn wss_senza_ca_cert_ne_opt_in_e_rifiutato() {
+        let err = config("", "wss://master.example.com").validate().unwrap_err();
+        assert!(err.to_string().contains("ca_cert"));
+    }
+
+    #[test]
+    fn wss_con_ca_cert_e_accettato_anche_se_il_file_non_esiste_ancora() {
+        // validate() controlla solo che ca_cert sia CONFIGURATO, non che il
+        // file esista già: la lettura/parsing del PEM avviene dopo, in
+        // ws::init_tls, con un errore dedicato se il file manca o è invalido.
+        config(
+            "ca_cert = \"/etc/dog-agent/dognet-ca.pem\"",
+            "wss://master.example.com",
+        )
+        .validate()
+        .expect("ca_cert configurato basta a passare la validazione");
+    }
+
+    #[test]
+    fn wss_con_allow_insecure_tls_e_accettato() {
+        config("allow_insecure_tls = true", "wss://master.example.com")
+            .validate()
+            .expect("allow_insecure_tls=true è un opt-in valido");
+    }
+
+    #[test]
+    fn ws_in_chiaro_non_richiede_ca_cert_ne_opt_in() {
+        config("", "ws://master.example.com")
+            .validate()
+            .expect("ws:// non usa TLS, nessun vincolo su ca_cert");
+    }
+}

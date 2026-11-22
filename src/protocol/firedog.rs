@@ -1,12 +1,12 @@
-/// Protocollo WebSocket FireDog — tipi di messaggio Agent ↔ Server.
-///
-/// Ogni messaggio è JSON con campo `"type"` come discriminante.
-///
-/// Flusso:
-///   1. Agent invia `pair_request`
-///   2. Server risponde con `pairing_status` (fase 1 + fase 2)
-///   3. Agent entra nel loop: heartbeat ogni 30s, threat_log on-demand
-///   4. Server invia `command`, agent risponde con `command_response`
+//! Protocollo WebSocket FireDog — tipi di messaggio Agent ↔ Server.
+//!
+//! Ogni messaggio è JSON con campo `"type"` come discriminante.
+//!
+//! Flusso:
+//!   1. Agent invia `pair_request`
+//!   2. Server risponde con `pairing_status` (fase 1 + fase 2)
+//!   3. Agent entra nel loop: heartbeat ogni 30s, threat_log on-demand
+//!   4. Server invia `command`, agent risponde con `command_response`
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,10 @@ pub enum AgentMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Campi del contratto wire: deserializzati dai messaggi del server, non tutti
+// consumati dall'agent (es. target_id). Mantenuti per documentare il protocollo
+// e deserializzare correttamente i messaggi.
+#[allow(dead_code)]
 pub enum ServerMessage {
     /// Risultato del pairing (fase 1 e/o fase 2)
     PairingStatus {
@@ -186,6 +190,13 @@ pub enum CommandAction {
     BlockIp,
     UnblockIp,
     UpdateConfig,
+    /// Impostazioni pcap (path salvataggio, tool tcpdump/tshark, filtri
+    /// custom) — SystemSettings globali lato Django, pushate a tutti i
+    /// target connessi quando l'admin le salva (vedi
+    /// backend/settings/views.py). Scrive /etc/firewall/firedog.conf, letto
+    /// da firewall-manager.py/traffic-analyzer.py ad ogni invocazione
+    /// (nessun demone da riavviare, a differenza di UpdateConfig).
+    UpdatePcapConfig,
     CheckIntegrity,
     #[serde(other)]
     Unknown,

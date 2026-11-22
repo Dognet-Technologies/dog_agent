@@ -1,0 +1,1133 @@
+// ============================================================================
+// Hardening executor (agent side) — applica un template CyberShepherd sul target
+// ============================================================================
+// Riceve `template_config` (JSON derivato dal YAML) e lo applica.
+// Struttura: template.hardening_steps[] (= controlli) → step.tasks[] (azioni).
+// Modalità: "dry_run" (nessuna modifica, solo piano) o "apply" (esecuzione reale
+// con backup dei file e raccolta di rollback_data).
+//
+// SICUREZZA: in dry_run non viene eseguito nulla che modifichi il sistema
+// (né comandi/script, né scritture file, né pacchetti/servizi).
+
+use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
+use tracing::{info, warn};
+
+pub struct HardeningOutcome {
+    pub status: String, // "completed" | "failed"
+    pub total_controls: i32,
+    pub successful_controls: i32,
+    pub failed_controls: i32,
+    pub skipped_controls: i32,
+    pub execution_log: String,
+    pub rollback_data: Value,
+    pub error: Option<String>,
+    /// Esito per-controllo `[{"control_id": "<slug YAML>", "status": "ok"|"failed"|"skipped"}]`,
+    /// usato dal server per aggiornare `target_control_status` via
+    /// `hardening_template_controls` (uno step "skipped" non tocca lo stato).
+    pub control_results: Vec<Value>,
+}
+
+/// Aggiornamento di avanzamento emesso dopo ogni controllo, così il server/UI
+/// mostra in tempo reale cosa sta accadendo (log parziale incluso).
+#[derive(Clone)]
+pub struct ProgressUpdate {
+    pub total: i32,
+    pub successful: i32,
+    pub failed: i32,
+    pub current_control: String,
+    pub log: String,
+}
+
+/// Punto d'ingresso: applica (o simula) il template. Funzione bloccante:
+/// va chiamata in `spawn_blocking`. `on_progress` è invocata dopo ogni controllo.
+/// `excluded` = `control_id` (slug YAML) da NON eseguire su questo target in
+/// questa esecuzione (Fase B, editor di esclusione per-target) — un check
+/// escluso resta "non conforme" (scelta esplicita dell'utente), distinto dal
+/// "mark not applicable" su `target_security_audit_status`.
+pub fn run_hardening(
+    template: &Value,
+    mode: &str,
+    excluded: &[String],
+    mut on_progress: impl FnMut(ProgressUpdate),
+) -> HardeningOutcome {
+    let dry = mode != "apply";
+    let os_family = detect_os_family();
+    let mut log = String::new();
+    let mut file_backups: Vec<Value> = Vec::new();
+
+    macro_rules! logln { ($($a:tt)*) => {{ log.push_str(&format!($($a)*)); log.push('\n'); }} }
+
+    logln!("=== Hardening {} (os_family={}) ===", if dry { "DRY-RUN" } else { "APPLY" }, os_family);
+
+    let steps = template.get("hardening_steps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let total = steps.len() as i32;
+    let mut ok_controls = 0i32;
+    let mut failed_controls = 0i32;
+    let mut skipped_controls = 0i32;
+    let mut control_results: Vec<Value> = Vec::with_capacity(steps.len());
+
+    for step in &steps {
+        let cname = step.get("control_id").and_then(|v| v.as_str())
+            .or_else(|| step.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("control");
+
+        if excluded.iter().any(|c| c == cname) {
+            logln!("\n--- Controllo: {} — [ESCLUSO] non eseguito per questo target ---", cname);
+            skipped_controls += 1;
+            control_results.push(json!({ "control_id": cname, "status": "skipped" }));
+            info!("Hardening: controllo '{}' escluso per questo target", cname);
+            on_progress(ProgressUpdate {
+                total,
+                successful: ok_controls,
+                failed: failed_controls,
+                current_control: cname.to_string(),
+                log: log.clone(),
+            });
+            continue;
+        }
+
+        logln!("\n--- Controllo: {} ---", cname);
+
+        let tasks = step.get("tasks").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut control_ok = true;
+
+        for task in &tasks {
+            let tname = task.get("name").and_then(|v| v.as_str()).unwrap_or("task");
+            let action = task.get("action").and_then(|v| v.as_str());
+
+            // Valuta condition (os_family/service_exists/mount_exists).
+            if let Some(cond) = task.get("condition").and_then(|v| v.as_str()) {
+                if !eval_condition(cond, &os_family) {
+                    logln!("  [skip] {} (condizione non soddisfatta: {})", tname, cond);
+                    continue;
+                }
+            }
+
+            let action = match action {
+                Some(a) => a,
+                None => { logln!("  [skip] {} (nessuna action)", tname); continue; }
+            };
+
+            let tolerant = task.get("allow_failure").and_then(|v| v.as_bool()).unwrap_or(false)
+                || task.get("failure_action").and_then(|v| v.as_str()) == Some("warn");
+
+            let res = apply_task(action, task, dry, &mut file_backups);
+            match res {
+                Ok(msg) => logln!("  [ok] {} — {}", tname, msg),
+                Err(e) => {
+                    if tolerant {
+                        logln!("  [warn] {} — {} (non bloccante)", tname, e);
+                    } else {
+                        logln!("  [FAIL] {} — {}", tname, e);
+                        control_ok = false;
+                    }
+                }
+            }
+        }
+
+        if control_ok { ok_controls += 1; } else { failed_controls += 1; }
+        control_results.push(json!({ "control_id": cname, "status": if control_ok { "ok" } else { "failed" } }));
+
+        // Notifica l'avanzamento (log parziale) dopo ogni controllo.
+        info!("Hardening: controllo '{}' → {}/{} ok, {} falliti", cname, ok_controls, total, failed_controls);
+        on_progress(ProgressUpdate {
+            total,
+            successful: ok_controls,
+            failed: failed_controls,
+            current_control: cname.to_string(),
+            log: log.clone(),
+        });
+    }
+
+    // L'esecuzione è "completed" se è arrivata in fondo: i controlli falliti sono
+    // riportati in failed_controls (dettaglio parziale), non un errore d'esecuzione.
+    // "failed" è riservato a un errore catastrofico che impedisce di procedere.
+    let status = "completed";
+    logln!(
+        "\n=== Risultato: {}/{} controlli ok, {} falliti, {} esclusi ===",
+        ok_controls, total, failed_controls, skipped_controls
+    );
+    info!(
+        "Hardening {}: {}/{} ok, {} falliti, {} esclusi",
+        if dry {"dry-run"} else {"apply"}, ok_controls, total, failed_controls, skipped_controls
+    );
+
+    HardeningOutcome {
+        status: status.to_string(),
+        total_controls: total,
+        successful_controls: ok_controls,
+        failed_controls,
+        skipped_controls,
+        execution_log: log,
+        rollback_data: json!({ "mode": mode, "files": file_backups }),
+        error: None,
+        control_results,
+    }
+}
+
+/// Esito dell'applicazione di UN task ad-hoc (non un template intero) — usato
+/// dal motore di remediation curata: un check con una entry in
+/// `security_audit_remediations` viene risolto a un singolo task della stessa
+/// DSL usata dai template (stesse azioni, stesso `apply_task`), non
+/// all'esecuzione del testo di remediation del tool esterno.
+pub struct SingleTaskOutcome {
+    pub ok: bool,
+    pub log: String,
+    pub error: Option<String>,
+    pub rollback_data: Value,
+}
+
+/// Applica (o simula) un singolo task della DSL, fuori dal contesto di un
+/// template intero. Bloccante: va chiamata in `spawn_blocking`, come
+/// `run_hardening`.
+pub fn run_single_task(task: &Value, mode: &str) -> SingleTaskOutcome {
+    let dry = mode != "apply";
+    let mut file_backups: Vec<Value> = Vec::new();
+
+    let Some(action) = task.get("action").and_then(|v| v.as_str()) else {
+        return SingleTaskOutcome {
+            ok: false,
+            log: String::new(),
+            error: Some("task senza campo 'action'".to_string()),
+            rollback_data: json!({}),
+        };
+    };
+
+    match apply_task(action, task, dry, &mut file_backups) {
+        Ok(msg) => SingleTaskOutcome {
+            ok: true,
+            log: msg,
+            error: None,
+            rollback_data: json!({ "mode": mode, "files": file_backups }),
+        },
+        Err(e) => SingleTaskOutcome {
+            ok: false,
+            log: String::new(),
+            error: Some(e),
+            rollback_data: json!({ "mode": mode, "files": file_backups }),
+        },
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dispatch azioni
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn apply_task(action: &str, task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    match action {
+        "file_content" | "file_section" => act_file_content(task, dry, backups),
+        "file_copy" => act_file_copy(task, dry, backups),
+        "file_line_present" => act_file_line_present(task, dry, backups),
+        "file_line_replace" => act_file_line_replace(task, dry, backups),
+        "file_section_update" => act_file_section_update(task, dry, backups),
+        "sysctl_value" => act_sysctl(task, dry),
+        "systemd_service" => act_systemd(task, dry),
+        "package_install" => act_package_install(task, dry),
+        "cron_entry" => act_cron(task, dry, backups),
+        "fstab_entry" => act_fstab(task, dry, backups),
+        "command" => act_command(task, dry),
+        "script" => act_script(task, dry),
+        other => Err(format!("action non supportata: {other}")),
+    }
+}
+
+// ── file helpers ─────────────────────────────────────────────────────────────
+
+fn s<'a>(t: &'a Value, k: &str) -> Option<&'a str> { t.get(k).and_then(|v| v.as_str()) }
+
+fn record_backup(backups: &mut Vec<Value>, path: &str) {
+    let existed = std::path::Path::new(path).exists();
+    let content = if existed { std::fs::read_to_string(path).ok() } else { None };
+    backups.push(json!({ "path": path, "existed": existed, "content": content }));
+    if existed {
+        // copia .bak best-effort per ripristino manuale immediato
+        let _ = std::fs::copy(path, format!("{path}.cybersheppard.bak"));
+    }
+}
+
+fn apply_owner_mode(path: &str, task: &Value) -> Result<(), String> {
+    if let Some(mode) = s(task, "mode") {
+        // Modalità ottale tipo "0644"/"0750"; from_str_radix gestisce lo zero iniziale.
+        // Prima di questo fix un mode malformato o un set_permissions
+        // fallito (disco pieno, path read-only) venivano scartati in
+        // silenzio: il controllo veniva comunque registrato come "ok" e
+        // riportato al server come conforme (MEDIUM trovato in code
+        // review, 2026-11) — a differenza del ramo chown poco sotto, che
+        // già propagava correttamente i propri errori.
+        let m = u32::from_str_radix(mode.trim().trim_start_matches("0o"), 8)
+            .map_err(|e| format!("mode '{mode}' non valido: {e}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m))
+            .map_err(|e| format!("set_permissions {path} (mode {mode}): {e}"))?;
+    }
+    if let Some(owner) = s(task, "owner") {
+        // chown user[:group]
+        let status = Command::new("chown").arg(owner).arg(path).status()
+            .map_err(|e| format!("chown: {e}"))?;
+        if !status.success() { return Err(format!("chown {owner} {path} fallito")); }
+    }
+    Ok(())
+}
+
+/// Path che la DSL di hardening non deve mai poter scrivere, indipendentemente
+/// da cosa richieda un template — anche uno curato può contenere un errore, e
+/// un template arrivato tramite un canale di pairing/autorizzazione
+/// compromesso non deve poter alterare credenziali/privilegi direttamente
+/// scrivendo su questi file. Il vero controllo di autorizzazione su CHI può
+/// inviare un comando `execute_hardening`/`apply_remediation` vive a monte
+/// (nel master): questo è un secondo strato di difesa, non l'unico.
+///
+/// Il confronto è per componenti sul path normalizzato E su quello con i
+/// symlink risolti (la scrittura segue i symlink): prima era un confronto
+/// esatto di stringhe, aggirabile con `/etc//shadow`, `/etc/./passwd`,
+/// `/tmp/../etc/shadow` o un symlink verso un file protetto (HIGH, seconda
+/// review 2026-11). Path relativi o con `..` sono rifiutati in blocco.
+///
+/// NB: le azioni `command`/`script` eseguono shell arbitraria per design,
+/// quindi questa lista protegge dagli errori dei template sulle azioni file,
+/// non da un template ostile: quello va fermato a monte (firma dei template).
+fn is_protected_path(path: &str) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    let raw = Path::new(path);
+    if !raw.is_absolute() || raw.components().any(|c| matches!(c, Component::ParentDir)) {
+        return true;
+    }
+    // Normalizzazione lessicale: components() elimina già `.` e `//`.
+    let lexical: PathBuf = raw.components().collect();
+    // Con i symlink risolti: il file se esiste, altrimenti la directory padre.
+    let resolved = std::fs::canonicalize(&lexical).ok().or_else(|| {
+        let parent = std::fs::canonicalize(lexical.parent()?).ok()?;
+        Some(parent.join(lexical.file_name()?))
+    });
+    std::iter::once(lexical.as_path())
+        .chain(resolved.as_deref())
+        .any(is_protected_normalized)
+}
+
+/// Regole della denylist su un path assoluto già normalizzato.
+fn is_protected_normalized(path: &std::path::Path) -> bool {
+    use std::path::Path;
+
+    /// File di credenziali/privilegi (e le loro copie `-` di shadow-utils).
+    const EXACT: &[&str] = &[
+        "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
+        "/etc/passwd", "/etc/passwd-", "/etc/group", "/etc/group-",
+        "/etc/sudoers", "/etc/ld.so.preload", "/etc/security/opasswd",
+    ];
+    /// Directory il cui intero contenuto è fuori portata della DSL: sudo,
+    /// config dell'agent stesso (ca_cert/allow_insecure_tls), binari e
+    /// librerie di sistema, script della suite eseguiti come root.
+    const TREES: &[&str] = &[
+        "/etc/sudoers.d", "/etc/dog-agent", "/root/.ssh",
+        "/bin", "/sbin", "/lib", "/lib64", "/usr/bin", "/usr/sbin",
+        "/usr/lib", "/usr/lib64", "/usr/local/bin", "/usr/local/sbin",
+        "/opt/sentinelsuite",
+    ];
+
+    if EXACT.iter().any(|p| path == Path::new(p)) {
+        return true;
+    }
+    if TREES.iter().any(|t| path.starts_with(t)) {
+        return true;
+    }
+    // Qualunque ~/.ssh (authorized_keys, chiavi private, config).
+    if path.components().any(|c| c.as_os_str() == ".ssh") {
+        return true;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "authorized_keys" || name == "authorized_keys2" {
+        return true;
+    }
+    // Chiavi host SSH: /etc/ssh/ssh_host_*  (sshd_config resta scrivibile).
+    path.starts_with("/etc/ssh") && name.starts_with("ssh_host_")
+}
+
+fn act_file_content(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    let file = s(task, "file").ok_or("file mancante")?;
+    let content = s(task, "content").ok_or("content mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
+    if dry { return Ok(format!("scriverebbe {} ({} byte)", file, content.len())); }
+    if let Some(parent) = std::path::Path::new(file).parent() { let _ = std::fs::create_dir_all(parent); }
+    record_backup(backups, file);
+    std::fs::write(file, content).map_err(|e| format!("write {file}: {e}"))?;
+    apply_owner_mode(file, task)?;
+    Ok(format!("scritto {file}"))
+}
+
+fn act_file_copy(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    let src = s(task, "src").ok_or("src mancante")?;
+    let dest = s(task, "dest").ok_or("dest mancante")?;
+    if is_protected_path(dest) {
+        return Err(format!("path protetto, scrittura rifiutata: {dest}"));
+    }
+    if dry { return Ok(format!("copierebbe {src} → {dest}")); }
+    if !std::path::Path::new(src).exists() {
+        return Err(format!("src {src} non presente sul target"));
+    }
+    if let Some(parent) = std::path::Path::new(dest).parent() { let _ = std::fs::create_dir_all(parent); }
+    record_backup(backups, dest);
+    std::fs::copy(src, dest).map_err(|e| format!("copy: {e}"))?;
+    apply_owner_mode(dest, task)?;
+    Ok(format!("copiato → {dest}"))
+}
+
+/// Assicura che una o più righe siano presenti in un file. Supporta sia
+/// `line` (singola) sia `lines` (array — es. le due righe PAM preauth+authfail
+/// di pam_faillock, che vanno inserite insieme da un solo task) e, opzionali:
+/// - `anchor`+`position` ("before"|"after"): inserisce vicino alla prima riga
+///   che soddisfa il pattern regex `anchor`, invece che in fondo al file;
+/// - `replace_regex`: se una riga esistente combacia, viene SOSTITUITA con la
+///   nuova invece di aggiungerne una seconda (usato per parametri con default
+///   già presenti nel file, es. PASS_MAX_DAYS in /etc/login.defs);
+/// - `comment`: riga di commento inserita una volta sola sopra il blocco
+///   aggiunto (ignorata se non si aggiunge nulla, es. tutto già presente).
+fn act_file_line_present(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    let file = s(task, "file").ok_or("file mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
+
+    // Ogni entry porta la propria riga + una posizione OPZIONALE
+    // (Some(true)="before", Some(false)="after") che sovrascrive quella
+    // condivisa del task per quella singola riga. Serve per stack ordinati
+    // (es. PAM) dove due righe vanno inserite ai due lati OPPOSTI dello
+    // stesso anchor nella stessa chiamata (una riga sola position/lines[]
+    // condivisi non lo esprime - causa reale di un'autenticazione rotta
+    // trovata testando NIST-AC-013/ISO27001-A.8.5-005, vedi migrazione
+    // 045 in CyberSheppard-Microsiem). `line`/`lines` restano invariati
+    // (nessuna posizione propria, usano sempre quella condivisa del task) -
+    // compatibilità totale con tutte le remediation già curate.
+    let mut wanted: Vec<(String, Option<bool>)> = Vec::new();
+    if let Some(l) = s(task, "line") {
+        wanted.push((l.to_string(), None));
+    }
+    if let Some(arr) = task.get("lines").and_then(|v| v.as_array()) {
+        wanted.extend(
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| (s.to_string(), None)),
+        );
+    }
+    if let Some(arr) = task.get("entries").and_then(|v| v.as_array()) {
+        for e in arr {
+            if let Some(line) = e.get("line").and_then(|v| v.as_str()) {
+                let pos = e
+                    .get("position")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p == "before");
+                wanted.push((line.to_string(), pos));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Err("line mancante".to_string());
+    }
+
+    let replace_regex = task.get("replace_regex").and_then(|v| v.as_str());
+    let anchor_re = task
+        .get("anchor")
+        .and_then(|v| v.as_str())
+        .and_then(|pat| regex::Regex::new(pat).ok());
+    let default_position_before = task.get("position").and_then(|v| v.as_str()) == Some("before");
+    let comment = task.get("comment").and_then(|v| v.as_str());
+
+    let existing = std::fs::read_to_string(file).unwrap_or_default();
+    let mut out: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut inserted = 0usize;
+    let mut replaced = 0usize;
+    let mut already = 0usize;
+
+    for (want, per_entry_position) in &wanted {
+        if out.iter().any(|l| l.trim() == want.trim()) {
+            already += 1;
+            continue;
+        }
+
+        if let Some(pattern) = replace_regex {
+            // Il pattern è condiviso da tutte le `wanted` (es. una alternanza
+            // "^(A|B|C)\s+.*" per un intero gruppo di parametri): non basta il
+            // primo match, va anche la stessa "chiave" (prima parola) della
+            // riga desiderata, altrimenti una entry rimpiazzerebbe quella di
+            // un'altra chiave già sostituita in questo stesso giro.
+            let key = want.split_whitespace().next();
+            if let Ok(re) = regex::Regex::new(pattern) {
+                let idx = out
+                    .iter()
+                    .position(|l| re.is_match(l) && l.split_whitespace().next() == key);
+                if let Some(idx) = idx {
+                    out[idx] = want.clone();
+                    replaced += 1;
+                    continue;
+                }
+            }
+        }
+
+        // L'anchor viene ri-cercato ad OGNI riga (non solo alla prima):
+        // se una riga precedente in questo stesso giro è già stata inserita
+        // prima dell'anchor, la posizione dell'anchor stesso si sposta in
+        // avanti - ricalcolarla ogni volta è quello che permette a due
+        // entry con position diversa (before/after) di finire nel punto
+        // giusto l'una rispetto all'altra, invece di finire entrambe dallo
+        // stesso lato.
+        let position_before = per_entry_position.unwrap_or(default_position_before);
+        let mut insert_at = anchor_re
+            .as_ref()
+            .and_then(|re| out.iter().position(|l| re.is_match(l)))
+            .map(|idx| if position_before { idx } else { idx + 1 })
+            .unwrap_or(out.len());
+
+        if inserted == 0 {
+            if let Some(c) = comment {
+                out.insert(insert_at.min(out.len()), c.to_string());
+                insert_at += 1;
+            }
+        }
+        out.insert(insert_at.min(out.len()), want.clone());
+        inserted += 1;
+    }
+
+    if inserted == 0 && replaced == 0 {
+        return Ok(format!("{already} riga/e già presenti in {file}"));
+    }
+    if dry {
+        return Ok(format!(
+            "aggiornerebbe {file} ({inserted} da aggiungere, {replaced} da sostituire)"
+        ));
+    }
+    record_backup(backups, file);
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    std::fs::write(file, joined).map_err(|e| format!("write {file}: {e}"))?;
+    Ok(format!(
+        "{file} ({inserted} aggiunte, {replaced} sostituite)"
+    ))
+}
+
+fn act_file_line_replace(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    let file = s(task, "file").ok_or("file mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
+    let search = s(task, "search").ok_or("search mancante")?;
+    let replace = s(task, "replace").unwrap_or("");
+    let create_if_missing = task.get("create_if_missing").and_then(|v| v.as_bool()).unwrap_or(false);
+    let re = regex::Regex::new(search).map_err(|e| format!("regex '{search}': {e}"))?;
+    let existing = std::fs::read_to_string(file).unwrap_or_default();
+    let matched = existing.lines().any(|l| re.is_match(l));
+
+    if dry {
+        return Ok(if matched { format!("sostituirebbe in {file}") }
+                  else if create_if_missing { format!("aggiungerebbe (non trovato) in {file}") }
+                  else { format!("nessun match in {file} (nessuna modifica)") });
+    }
+    record_backup(backups, file);
+    let mut out: Vec<String> = Vec::new();
+    for l in existing.lines() {
+        if re.is_match(l) { out.push(replace.to_string()); } else { out.push(l.to_string()); }
+    }
+    if !matched && create_if_missing { out.push(replace.to_string()); }
+    let mut joined = out.join("\n"); joined.push('\n');
+    std::fs::write(file, joined).map_err(|e| format!("write {file}: {e}"))?;
+    Ok(format!("aggiornato {file}"))
+}
+
+fn act_file_section_update(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    // Gestione semplice: assicura che `content` (che include l'header di sezione)
+    // sia presente nel file; se assente lo appende. Idempotente sul blocco.
+    let file = s(task, "file").ok_or("file mancante")?;
+    let content = s(task, "content").ok_or("content mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
+    let existing = std::fs::read_to_string(file).unwrap_or_default();
+    if existing.contains(content.trim()) {
+        return Ok(format!("sezione già presente in {file}"));
+    }
+    if dry { return Ok(format!("aggiornerebbe sezione in {file}")); }
+    record_backup(backups, file);
+    let mut new = existing;
+    if !new.is_empty() && !new.ends_with('\n') { new.push('\n'); }
+    new.push_str(content); new.push('\n');
+    std::fs::write(file, new).map_err(|e| format!("write {file}: {e}"))?;
+    Ok(format!("sezione aggiornata in {file}"))
+}
+
+fn act_sysctl(task: &Value, dry: bool) -> Result<String, String> {
+    let param = s(task, "parameter").ok_or("parameter mancante")?;
+    let value = task.get("value").map(|v| v.to_string().trim_matches('"').to_string())
+        .ok_or("value mancante")?;
+    if dry { return Ok(format!("sysctl {param}={value}")); }
+    // Persistente + runtime.
+    let conf = "/etc/sysctl.d/99-cybersheppard-hardening.conf".to_string();
+    let line = format!("{param} = {value}");
+    let existing = std::fs::read_to_string(&conf).unwrap_or_default();
+    if !existing.lines().any(|l| l.trim_start().starts_with(param)) {
+        let mut new = existing;
+        if !new.is_empty() && !new.ends_with('\n') { new.push('\n'); }
+        new.push_str(&line); new.push('\n');
+        // Prima di questo fix un fallimento qui (disco pieno, /etc/sysctl.d
+        // read-only) veniva scartato in silenzio: il valore runtime poteva
+        // applicarsi ma non sopravvivere a un reboot, senza che nulla lo
+        // segnalasse (MEDIUM trovato in code review, 2026-11).
+        std::fs::write(&conf, new).map_err(|e| format!("scrittura {conf}: {e}"))?;
+    }
+    let status = Command::new("sysctl").arg("-w").arg(format!("{param}={value}")).status()
+        .map_err(|e| format!("sysctl: {e}"))?;
+    if !status.success() { return Err(format!("sysctl -w {param}={value} fallito")); }
+    Ok(format!("sysctl {param}={value}"))
+}
+
+fn act_systemd(task: &Value, dry: bool) -> Result<String, String> {
+    let svc = s(task, "service").ok_or("service mancante")?;
+    let state = s(task, "state").unwrap_or("disabled");
+    let args: Vec<&str> = match state {
+        "disabled" | "disable" => vec!["disable", "--now"],
+        "enabled" | "enable" => vec!["enable", "--now"],
+        "masked" | "mask" => vec!["mask"],
+        "stopped" | "stop" => vec!["stop"],
+        "started" | "start" => vec!["start"],
+        other => return Err(format!("state systemd sconosciuto: {other}")),
+    };
+    if dry { return Ok(format!("systemctl {} {}", args.join(" "), svc)); }
+    let status = Command::new("systemctl").args(&args).arg(svc).status()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    if !status.success() { return Err(format!("systemctl {} {} fallito", args.join(" "), svc)); }
+    Ok(format!("systemctl {} {}", args.join(" "), svc))
+}
+
+fn act_package_install(task: &Value, dry: bool) -> Result<String, String> {
+    let pkgs: Vec<String> = task.get("packages").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if pkgs.is_empty() { return Err("packages vuoto".into()); }
+    if dry { return Ok(format!("installerebbe: {}", pkgs.join(", "))); }
+    let list = pkgs.join(" ");
+    // Non-interattivo + timeout di rete, per non restare appesi (es. mirror
+    // irraggiungibili). Il timeout complessivo del task fa da rete di sicurezza.
+    let cmdline = match detect_pkg_mgr().as_str() {
+        "apt" => format!(
+            "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=30 install -y {list}"
+        ),
+        "zypper" => format!("zypper --non-interactive install {list}"),
+        "dnf" => format!("dnf install -y --setopt=timeout=20 {list}"),
+        m => return Err(format!("package manager non supportato: {m}")),
+    };
+    let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(180);
+    let (code, out, timed_out) = run_shell(&cmdline, secs);
+    if timed_out {
+        return Err(format!("timeout install {list} dopo {secs}s (mirror irraggiungibile?)"));
+    }
+    if code != 0 {
+        return Err(format!("install {} fallito (exit {}): {}", list, code, out.lines().last().unwrap_or("")));
+    }
+    Ok(format!("installati: {list}"))
+}
+
+fn act_cron(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    let file = s(task, "cron_file").ok_or("cron_file mancante")?;
+    let entry = s(task, "entry").ok_or("entry mancante")?;
+    if is_protected_path(file) {
+        return Err(format!("path protetto, scrittura rifiutata: {file}"));
+    }
+    if dry { return Ok(format!("scriverebbe cron {file}")); }
+    record_backup(backups, file);
+    let mut body = String::from("# CyberShepherd hardening\n");
+    body.push_str(entry); body.push('\n');
+    std::fs::write(file, body).map_err(|e| format!("write {file}: {e}"))?;
+    let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644));
+    Ok(format!("cron scritto {file}"))
+}
+
+fn act_fstab(task: &Value, dry: bool, backups: &mut Vec<Value>) -> Result<String, String> {
+    let mount = s(task, "mount_point").ok_or("mount_point mancante")?;
+    let options = s(task, "options").ok_or("options mancante")?;
+    let fstab = "/etc/fstab";
+    let existing = std::fs::read_to_string(fstab).unwrap_or_default();
+    // Cerca la riga della mount esistente (2° campo = mount point).
+    let has_line = existing.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() >= 2 && f[1] == mount && !l.trim_start().starts_with('#')
+    });
+    if !has_line { return Err(format!("mount {mount} non presente in fstab (skip)")); }
+    if dry { return Ok(format!("aggiornerebbe opzioni fstab per {mount} → {options}")); }
+    record_backup(backups, fstab);
+    let mut out: Vec<String> = Vec::new();
+    for l in existing.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() >= 4 && f[1] == mount && !l.trim_start().starts_with('#') {
+            out.push(format!("{} {} {} {} {} {}", f[0], f[1], f[2], options,
+                f.get(4).unwrap_or(&"0"), f.get(5).unwrap_or(&"0")));
+        } else { out.push(l.to_string()); }
+    }
+    let mut joined = out.join("\n"); joined.push('\n');
+    std::fs::write(fstab, joined).map_err(|e| format!("write fstab: {e}"))?;
+    Ok(format!("fstab aggiornato per {mount}"))
+}
+
+fn act_command(task: &Value, dry: bool) -> Result<String, String> {
+    let cmd = s(task, "command").ok_or("command mancante")?;
+    // Audit trail LOCALE (journalctl), indipendente da cosa arriva al master
+    // nell'execution_log: resta una traccia forense anche se quel report
+    // viene perso o manomesso lungo il canale di pairing.
+    info!(dry, command = %cmd, "hardening: comando da eseguire (audit trail locale)");
+    let expected = task.get("expected_exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
+    if dry { return Ok(format!("eseguirebbe: {}", first_line(cmd))); }
+    let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
+    let (code, out, timed_out) = run_shell(cmd, secs);
+    if timed_out {
+        return Err(format!("timeout dopo {}s: {}", secs, first_line(cmd)));
+    }
+    if code as i64 != expected {
+        return Err(format!("exit {} (atteso {}): {}", code, expected, out.lines().last().unwrap_or("")));
+    }
+    Ok(format!("comando ok (exit {code})"))
+}
+
+fn act_script(task: &Value, dry: bool) -> Result<String, String> {
+    let script = s(task, "script").ok_or("script mancante")?;
+    // Audit trail locale — vedi commento in act_command.
+    info!(dry, script = %script, "hardening: script da eseguire (audit trail locale)");
+    if dry { return Ok(format!("eseguirebbe script ({} righe)", script.lines().count())); }
+    let secs = task.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
+    let (code, out, timed_out) = run_shell(script, secs);
+    if timed_out { return Err(format!("timeout dopo {secs}s")); }
+    if code != 0 {
+        // L'output (stdout+stderr uniti) è indispensabile per capire PERCHÉ uno
+        // script è fallito (es. quale comando ha dato errore) - scartarlo qui
+        // lascia solo "script exit N" nei log, senza indizi utili.
+        return Err(format!("script exit {}: {}", code, out.trim()));
+    }
+    Ok("script ok".into())
+}
+
+/// Tetto all'output letto da un comando: un comando verboso (o un `yes`)
+/// non deve poter riempire la memoria dell'agent.
+const MAX_SHELL_OUTPUT_BYTES: u64 = 1024 * 1024;
+
+/// Crea `<temp_dir>/<prefix>-<uuid>` con mode 0700. `create` (non
+/// `create_all`) fallisce se il path esiste già, quindi nessuno può
+/// predisporlo in anticipo con permessi o symlink propri.
+pub(crate) fn create_private_tmp_dir(prefix: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+/// Legge al più `MAX_SHELL_OUTPUT_BYTES` da `path` (UTF-8 lossy).
+fn read_capped(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(MAX_SHELL_OUTPUT_BYTES).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Esegue un comando shell con timeout robusto. Punto chiave: l'output NON viene
+/// convogliato in una pipe verso l'agent ma REINDIRIZZATO su un file, così i
+/// figli orfani (es. i "method" di apt che sopravvivono al gruppo) non possono
+/// bloccare la raccolta dell'output. Allo scadere del timeout si uccide il
+/// process-group (best-effort) e comunque il processo diretto → l'agent prosegue.
+/// Ritorna (exit_code, output, timed_out).
+pub(crate) fn run_shell(cmd: &str, timeout_secs: u64) -> (i32, String, bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    // Tetto assoluto per non far bloccare un singolo task troppo a lungo
+    // (es. template con timeout molto alti su operazioni di rete). Override via
+    // HARDENING_TASK_MAX_SECS. Default 300s.
+    let max_secs = std::env::var("HARDENING_TASK_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    let timeout_secs = timeout_secs.min(max_secs);
+
+    // Output in una directory privata per-call (nome non prevedibile, 0700,
+    // creata solo se non esiste): prima era /tmp/cs-hardening-{pid}-{seq}.out,
+    // un nome prevedibile su cui un utente locale poteva piazzare un symlink
+    // e far scrivere root altrove (HIGH, seconda review 2026-11).
+    let dir = match create_private_tmp_dir("cs-hardening") {
+        Ok(d) => d,
+        Err(e) => return (-1, format!("creazione directory temporanea: {e}"), false),
+    };
+    let tmp_path = dir.join("out");
+    let tmp = tmp_path.to_string_lossy().into_owned();
+    // Redirect a file + stdin da /dev/null (niente prompt interattivi).
+    // `cmd` può arrivare con una o più righe vuote/newline finali (es. testo
+    // salvato con un newline di chiusura, comune per qualsiasi editor/tool):
+    // chiudendo con un `;` letterale subito dopo, bash vede una riga vuota
+    // seguita da un `;` senza alcun comando in mezzo -> "syntax error near
+    // unexpected token ';'" - il comando fallisce PRIMA di aprire la
+    // redirezione interna, quindi senza alcun output catturato (root cause
+    // di un fallimento "muto" trovato con azioni `script` multi-riga, es.
+    // NIST-AC-013/ISO27001-A.8.5-005 in CyberSheppard-Microsiem, 2026-09-20).
+    // `trim_end()` + newline (mai `;`) come separatore prima di `}` è
+    // robusto qualunque sia la formattazione finale di `cmd`.
+    let full = format!(
+        "{{ {}\n}} </dev/null >'{}' 2>&1",
+        cmd.trim_end(),
+        tmp.replace('\'', "'\\''")
+    );
+
+    let spawn = Command::new("bash")
+        .arg("-c")
+        .arg(&full)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => return (-1, format!("spawn error: {e}"), false),
+    };
+    let pid = child.id() as i32;
+    let start = Instant::now();
+    let mut timed_out = false;
+    let mut code = -1;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                code = st.code().unwrap_or(-1);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() >= Duration::from_secs(timeout_secs) {
+                    timed_out = true;
+                    // Best-effort: uccide il gruppo (bash + figli); poi il diretto.
+                    let _ = Command::new("kill").arg("-9").arg(format!("-{pid}")).status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(_) => break,
+        }
+    }
+    let out = read_capped(&tmp_path);
+    // Se il comando è fallito ma non abbiamo catturato nessun output, il file
+    // di supporto per il post-mortem vale più della pulizia immediata - un
+    // fallimento "muto" (es. errore di parsing della shell prima ancora che
+    // la redirezione interna prenda effetto) altrimenti non lascia alcuna
+    // traccia diagnosticabile.
+    if code != 0 && out.trim().is_empty() {
+        warn!(tmp = %tmp, code, cmd = %first_line(cmd), "run_shell: uscita non-zero senza output catturato, file mantenuto per diagnosi");
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    (code, out, timed_out)
+}
+
+// ── util ─────────────────────────────────────────────────────────────────────
+
+fn first_line(s: &str) -> String { s.lines().next().unwrap_or("").to_string() }
+
+fn detect_os_family() -> String {
+    let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default().to_lowercase();
+    if os.contains("debian") || os.contains("ubuntu") { "debian".into() }
+    else if os.contains("rhel") || os.contains("centos") || os.contains("rocky") || os.contains("alma") || os.contains("fedora") { "rhel".into() }
+    else if os.contains("suse") || os.contains("sles") { "sles".into() }
+    else { "linux".into() }
+}
+
+fn detect_pkg_mgr() -> String {
+    for (bin, name) in [("apt-get", "apt"), ("zypper", "zypper"), ("dnf", "dnf")] {
+        if Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false) {
+            return name.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Valuta le condition del mini-DSL dei template.
+fn eval_condition(cond: &str, os_family: &str) -> bool {
+    let c = cond.trim();
+    if let Some(rest) = c.strip_prefix("os_family") {
+        // os_family == 'debian'
+        if let Some(val) = rest.split(['=', '\'', '"']).find(|s| !s.trim().is_empty() && *s != " ") {
+            let want = val.trim().trim_matches(|ch| ch == '\'' || ch == '"' || ch == ' ');
+            return want == os_family;
+        }
+        return true;
+    }
+    if let Some(inner) = c.strip_prefix("service_exists(").and_then(|s| s.strip_suffix(")")) {
+        let svc = inner.trim_matches(|ch| ch == '\'' || ch == '"');
+        return Command::new("systemctl").arg("cat").arg(svc).output()
+            .map(|o| o.status.success()).unwrap_or(false);
+    }
+    if let Some(inner) = c.strip_prefix("mount_exists(").and_then(|s| s.strip_suffix(")")) {
+        let mp = inner.trim_matches(|ch| ch == '\'' || ch == '"');
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        return mounts.lines().any(|l| l.split_whitespace().nth(1) == Some(mp));
+    }
+    // Condizione sconosciuta → non blocca (applica).
+    warn!("condizione hardening non riconosciuta, la tratto come vera: {}", cond);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// File temporaneo che si autoelimina all'uscita dallo scope (Drop).
+    struct TmpFile(String);
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn tmp_file(content: &str) -> (TmpFile, String) {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("dog-agent-test-{}-{}", std::process::id(), seq))
+            .to_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(&path, content).unwrap();
+        (TmpFile(path.clone()), path)
+    }
+
+    #[test]
+    fn entries_posiziona_ogni_riga_indipendentemente_rispetto_allo_stesso_anchor() {
+        // Regressione del bug reale trovato testando NIST-AC-013/ISO27001-A.8.5-005
+        // (pam_faillock): con `lines`+`position` condivisi, preauth E authfail
+        // finivano ENTRAMBE prima di pam_unix.so - authfail deve valutare
+        // l'esito del modulo precedente, quindi va dopo, non prima. `entries`
+        // dà a ciascuna riga la propria posizione rispetto allo stesso anchor.
+        let (_f, path) = tmp_file("auth [success=1 default=ignore] pam_unix.so nullok\n");
+        let task = json!({
+            "file": path,
+            "anchor": "auth.*pam_unix.so",
+            "entries": [
+                {"line": "auth required pam_faillock.so preauth silent audit deny=5", "position": "before"},
+                {"line": "auth [default=die] pam_faillock.so authfail audit deny=5", "position": "after"},
+            ],
+        });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg.contains("2 aggiunte"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "auth required pam_faillock.so preauth silent audit deny=5");
+        assert_eq!(lines[1], "auth [success=1 default=ignore] pam_unix.so nullok");
+        assert_eq!(lines[2], "auth [default=die] pam_faillock.so authfail audit deny=5");
+
+        // Idempotente: rieseguendo non aggiunge duplicati né altera l'ordine.
+        let msg2 = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg2.contains("2 riga/e già presenti"));
+    }
+
+    #[test]
+    fn inserisce_piu_righe_dallo_stesso_task_lines() {
+        let (_f, path) = tmp_file("auth required pam_unix.so\n");
+        let task = json!({
+            "file": path,
+            "lines": [
+                "auth required pam_faillock.so preauth silent audit deny=5",
+                "auth [default=die] pam_faillock.so authfail audit deny=5",
+            ],
+        });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg.contains("2 aggiunte"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("pam_faillock.so preauth"));
+        assert!(content.contains("pam_faillock.so authfail"));
+
+        // Idempotente: rieseguendo non aggiunge duplicati.
+        let msg2 = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg2.contains("2 riga/e già presenti"));
+    }
+
+    #[test]
+    fn sostituisce_righe_esistenti_con_replace_regex() {
+        let (_f, path) = tmp_file("PASS_MAX_DAYS   99999\nPASS_MIN_DAYS   0\n");
+        let task = json!({
+            "file": path,
+            "lines": ["PASS_MAX_DAYS    90", "PASS_MIN_DAYS    1", "PASS_WARN_AGE    14"],
+            "replace_regex": "^(PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_WARN_AGE)\\s+.*",
+        });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, false, &mut backups).unwrap();
+        assert!(msg.contains("2 sostituite"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("PASS_MAX_DAYS    90"));
+        assert!(content.contains("PASS_MIN_DAYS    1"));
+        // PASS_WARN_AGE non esisteva già: niente da sostituire, va aggiunta in fondo.
+        assert!(content.contains("PASS_WARN_AGE    14"));
+    }
+
+    #[test]
+    fn inserisce_prima_dell_anchor_con_commento() {
+        let (_f, path) = tmp_file("account [success=1] pam_unix.so\naccount requisite pam_deny.so\n");
+        let task = json!({
+            "file": path,
+            "line": "account required pam_faillock.so",
+            "anchor": "account.*pam_unix.so",
+            "position": "before",
+            "comment": "# hardening",
+        });
+        let mut backups = Vec::new();
+        act_file_line_present(&task, false, &mut backups).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "# hardening");
+        assert_eq!(lines[1], "account required pam_faillock.so");
+        assert_eq!(lines[2], "account [success=1] pam_unix.so");
+    }
+
+    #[test]
+    fn dry_run_non_scrive_nulla() {
+        let (_f, path) = tmp_file("");
+        let task = json!({ "file": path, "line": "test" });
+        let mut backups = Vec::new();
+        let msg = act_file_line_present(&task, true, &mut backups).unwrap();
+        assert!(msg.contains("aggiornerebbe"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn script_con_newline_finale_non_rompe_il_wrapping() {
+        // Regressione: `run_shell` avvolgeva `cmd` in `{ cmd ; }` con un `;`
+        // letterale. Se `cmd` finisce con una riga vuota/newline (comune per
+        // testo salvato con newline di chiusura - è il caso reale di
+        // NIST-AC-013/ISO27001-A.8.5-005 in CyberSheppard-Microsiem, dove lo
+        // script è arrivato dal DB con un newline finale), bash vede un
+        // comando vuoto seguito da `;` -> "syntax error near unexpected
+        // token ';'" - lo script fallisce PRIMA di aprire la redirezione
+        // interna, quindi senza alcun output catturato (fallimento muto,
+        // 2026-09-20). Verifica che uno script con newline/righe vuote
+        // finali venga comunque esteguito correttamente.
+        let (_f, path) = tmp_file("");
+        let script = format!("echo ciao > {path}\n\n");
+        let task = json!({ "script": script });
+        let msg = act_script(&task, false).unwrap();
+        assert_eq!(msg, "script ok");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "ciao");
+    }
+
+    #[test]
+    fn is_protected_path_rifiuta_file_credenziali_e_accetta_config_normali() {
+        for p in [
+            "/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/sudoers",
+            "/etc/sudoers.d/90-cloud-init-users",
+            "/root/.ssh/authorized_keys", "/home/user/.ssh/authorized_keys",
+        ] {
+            assert!(is_protected_path(p), "{p} doveva essere protetto");
+        }
+        for p in ["/etc/ssh/sshd_config", "/etc/login.defs", "/etc/sysctl.d/99-x.conf", "/boot/grub/grub.cfg"] {
+            assert!(!is_protected_path(p), "{p} non doveva essere protetto");
+        }
+    }
+
+    #[test]
+    fn is_protected_path_non_aggirabile_con_varianti_del_path() {
+        // Regressione (seconda review, 2026-11): il confronto esatto di
+        // stringhe lasciava passare queste forme dello stesso file.
+        for p in [
+            "/etc//shadow", "/etc/./passwd", "/tmp/../etc/shadow", "etc/shadow",
+            "/etc/sudoers.d", "/etc/ld.so.preload", "/etc/group",
+            "/home/u/.ssh/id_ed25519", "/etc/ssh/ssh_host_ed25519_key",
+            "/etc/dog-agent/agent.conf", "/usr/bin/sudo", "/usr/local/bin/x",
+        ] {
+            assert!(is_protected_path(p), "{p} doveva essere protetto");
+        }
+    }
+
+    #[test]
+    fn run_shell_usa_una_directory_privata_e_la_rimuove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = create_private_tmp_dir("dog-agent-test").unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        // create() su un path già esistente deve fallire.
+        assert!(std::fs::DirBuilder::new().create(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700);
+
+        let (code, out, timed_out) = run_shell("echo $PWD >/dev/null; echo ok", 5);
+        assert_eq!((code, out.trim(), timed_out), (0, "ok", false));
+    }
+
+    #[test]
+    fn is_protected_path_segue_i_symlink() {
+        let dir = std::env::temp_dir().join(format!("dog-agent-prot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Symlink al file e alla directory: in entrambi i casi la scrittura
+        // finirebbe su un path protetto.
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("innocuo.conf")).unwrap();
+        std::os::unix::fs::symlink("/etc/sudoers.d", dir.join("conf.d")).unwrap();
+        let via_file = dir.join("innocuo.conf").to_string_lossy().into_owned();
+        let via_dir = dir.join("conf.d/nuovo").to_string_lossy().into_owned();
+        let normale = dir.join("normale.conf").to_string_lossy().into_owned();
+        let (a, b, c) = (is_protected_path(&via_file), is_protected_path(&via_dir), is_protected_path(&normale));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(a, "symlink a /etc/passwd non rilevato");
+        assert!(b, "symlink a /etc/sudoers.d non rilevato");
+        assert!(!c);
+    }
+
+    #[test]
+    fn act_file_content_rifiuta_path_protetti() {
+        let task = json!({ "file": "/etc/shadow", "content": "x" });
+        let mut backups = Vec::new();
+        let err = act_file_content(&task, false, &mut backups).unwrap_err();
+        assert!(err.contains("protetto"));
+    }
+
+    #[test]
+    fn act_file_line_present_rifiuta_path_protetti_anche_in_dry_run() {
+        let task = json!({ "file": "/etc/sudoers.d/evil", "line": "ALL ALL=(ALL) NOPASSWD: ALL" });
+        let mut backups = Vec::new();
+        let err = act_file_line_present(&task, true, &mut backups).unwrap_err();
+        assert!(err.contains("protetto"));
+    }
+
+    #[test]
+    fn run_hardening_salta_i_controlli_esclusi_senza_eseguirne_i_task() {
+        // Fase B (editor di esclusione per-target): un control_id in `excluded`
+        // non deve eseguire NESSUNO dei suoi task (verificato: il file bersaglio
+        // resta vuoto), deve contare in `skipped_controls` (non in successful/
+        // failed) e il suo `control_results` deve avere status "skipped".
+        let (_excluded_f, excluded_path) = tmp_file("");
+        let (_kept_f, kept_path) = tmp_file("");
+        let template = json!({
+            "hardening_steps": [
+                {
+                    "control_id": "step-escluso",
+                    "tasks": [{ "action": "file_line_present", "file": excluded_path, "line": "non deve comparire" }]
+                },
+                {
+                    "control_id": "step-normale",
+                    "tasks": [{ "action": "file_line_present", "file": kept_path, "line": "riga attesa" }]
+                }
+            ]
+        });
+
+        let outcome = run_hardening(&template, "apply", &["step-escluso".to_string()], |_| {});
+
+        assert_eq!(outcome.total_controls, 2);
+        assert_eq!(outcome.successful_controls, 1);
+        assert_eq!(outcome.failed_controls, 0);
+        assert_eq!(outcome.skipped_controls, 1);
+        assert_eq!(std::fs::read_to_string(&excluded_path).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(&kept_path).unwrap().trim(), "riga attesa");
+
+        let results = outcome.control_results;
+        let escluso = results.iter().find(|r| r["control_id"] == "step-escluso").unwrap();
+        assert_eq!(escluso["status"], "skipped");
+        let normale = results.iter().find(|r| r["control_id"] == "step-normale").unwrap();
+        assert_eq!(normale["status"], "ok");
+    }
+}

@@ -1,9 +1,27 @@
 # Dog Agent
 
 Agent unificato della Dognet Suite: un singolo binario Rust che si connette
-via WebSocket a uno o più backend **FireDog**, **CyberSheppard** e
+via WebSocket a uno o più backend **FireDog**, **CyberShepherd** e
 **SentinelCore** (predisposto), configurati come `[[targets]]` indipendenti
 in `/etc/dog-agent/agent.conf`.
+
+**Manuale completo** (configurazione, TLS, pairing, rilevamento minacce,
+comandi, problemi comuni): [docs/MANUALE.md](docs/MANUALE.md).
+
+## Novità in v1.3
+
+- **Certificato del master verificato su `wss://`.** L'agent non accetta più
+  in silenzio i certificati self-signed: serve `ca_cert` nella sezione
+  `[agent]`, con le CA dei master (CyberShepherd 0.37+ e FireDog 1.5.1+
+  hanno una CA locale per installazione). Senza, su un target `wss://`
+  l'agent non parte. Vedi [Connessione sicura](docs/MANUALE.md#4-connessione-sicura-al-master-tls).
+- **Laurel:** il punto di lettura è salvato in `/var/lib/dog-agent/`, gli
+  eventi non vengono più rispediti a ogni riconnessione (1.3.1).
+- **Brute-force SSH** letto anche dal journal (Debian 13, distro senza
+  rsyslog), solo gli ultimi 10 minuti, senza doppio conteggio (1.3.1).
+- **Blocchi IP in cima alla catena INPUT** e regole di FireDog prima dello
+  scarto finale di firewall-manager: prima un IP bloccato poteva ancora
+  entrare in SSH (1.3.1).
 
 ---
 
@@ -18,8 +36,9 @@ in `/etc/dog-agent/agent.conf`.
 | target musl | `rustup target add x86_64-unknown-linux-musl` | build statica musl |
 | `cross` + Docker | `cargo install cross` | cross-compile arm64 / Windows |
 
-Non servono librerie di sistema (OpenSSL ecc.): il TLS è **rustls** con root
-CA webpki incluse, quindi il binario non ha dipendenze runtime.
+Non servono librerie di sistema (OpenSSL ecc.): il TLS è **rustls**, quindi
+il binario non ha dipendenze runtime. Su `wss://` il certificato del master
+è verificato contro le CA in `ca_cert` (vedi `src/ws.rs` e il manuale).
 
 ## Compilazione
 
@@ -110,7 +129,7 @@ scp target/debian/dog-agent_*.deb utente@target:/tmp/
 sudo dpkg -i /tmp/dog-agent_*.deb
 
 # 2. Configura (il postinst copia l'esempio se agent.conf non esiste)
-sudo nano /etc/dog-agent/agent.conf     # url, api_key, ip/hostname/mac, target_id…
+sudo nano /etc/dog-agent/agent.conf     # url, api_key, ip/hostname/mac, ca_cert (vedi docs/MANUALE.md)
 
 # 3. Abilita e avvia
 sudo systemctl enable --now dog-agent
@@ -151,7 +170,9 @@ sudo dpkg -P dog-agent        # purge completo
 
 ## Configurazione
 
-Vedi `config.example.toml`: ogni `[[targets]]` gira in un task tokio
-indipendente con riconnessione a backoff esponenziale. Campi obbligatori per
-FireDog: `ip`, `hostname`, `mac` (il server verifica
-`SHA512(ip+hostname+mac)` nel pairing); per CyberSheppard: `target_id`.
+Vedi il [manuale](docs/MANUALE.md#5-riferimento-della-configurazione) e
+`config.example.toml`: ogni `[[targets]]` gira in un task indipendente con
+riconnessione a due livelli. FireDog richiede `ip`, `hostname` e `mac` (il
+server verifica `SHA512(ip+hostname+mac)` nel pairing); CyberShepherd
+accetta le stesse tre voci (pairing per identità) oppure `target_id`. Con un
+target `wss://` serve `ca_cert` nella sezione `[agent]`.
